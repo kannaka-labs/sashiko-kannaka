@@ -57,10 +57,22 @@ pub struct LinuxPatchReviewState {
     /// Retain pre-existing concerns through verification and inline report generation.
     pub report_preexisting: bool,
 
+    /// Target project identifier (e.g. "linux" or "sashiko") used for finding UUID prefixes.
+    pub project: String,
+
     /// Aggregated raw concerns collected from the analysis stages.
     pub all_concerns: Vec<Value>,
     /// Aggregated raw dismissed concerns collected from the analysis stages.
     pub all_dismissed_concerns: Vec<Value>,
+
+    /// Direct findings (Category 1a, VF1..VFp) emitted by the verification stage.
+    pub verification_findings: Vec<Value>,
+    /// Direct dismissals (Category 1b, VD1..VDq) emitted by the verification stage.
+    pub verification_dismissed: Vec<Value>,
+    /// Findings confirmed by parallel post-verification stages (PVF1..PVFr).
+    pub post_verification_findings: Vec<Value>,
+    /// Hard cases refuted by parallel post-verification stages (PVD1..PVDs).
+    pub post_verification_dismissed: Vec<Value>,
 
     /// Deduplicated dismissed concerns from the verification stage.
     pub deduplicated_dismissed_concerns: Vec<Value>,
@@ -567,6 +579,109 @@ pub fn validate_verification_stage_output(
         );
     }
 
+    validate_verification_source_ids(output, state)?;
+
+    Ok(())
+}
+
+fn extract_non_empty_source_ids<'a>(
+    collection_name: &str,
+    idx: usize,
+    item: &'a Value,
+    valid_ids_label: &str,
+) -> Result<Vec<&'a str>, String> {
+    let Some(arr) = item.get("source_ids").and_then(Value::as_array) else {
+        return Err(format!(
+            "{collection_name}[{idx}] must include a non-empty 'source_ids' array referencing input item ID(s) ({valid_ids_label})."
+        ));
+    };
+    let ids: Vec<&str> = arr
+        .iter()
+        .filter_map(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
+    if ids.is_empty() || ids.len() != arr.len() {
+        return Err(format!(
+            "{collection_name}[{idx}] must have a non-empty 'source_ids' array of non-empty string IDs ({valid_ids_label})."
+        ));
+    }
+    Ok(ids)
+}
+
+fn validate_verification_source_ids(
+    output: &VerificationOutput,
+    state: &LinuxPatchReviewState,
+) -> Result<(), String> {
+    let concern_ids: Vec<&str> = state
+        .all_concerns
+        .iter()
+        .filter_map(|c| c.get("id").and_then(Value::as_str).map(str::trim))
+        .filter(|id| !id.is_empty())
+        .collect();
+    let dismissed_ids: Vec<&str> = state
+        .all_dismissed_concerns
+        .iter()
+        .filter_map(|d| d.get("id").and_then(Value::as_str).map(str::trim))
+        .filter(|id| !id.is_empty())
+        .collect();
+
+    if concern_ids.is_empty() && dismissed_ids.is_empty() {
+        return Ok(());
+    }
+
+    let all_valid: Vec<&str> = concern_ids
+        .iter()
+        .chain(dismissed_ids.iter())
+        .copied()
+        .collect();
+    let valid_label = all_valid.join(", ");
+    let mut accounted = std::collections::BTreeSet::new();
+
+    for (collection_name, items, allow_concerns, allow_dismissed) in [
+        ("findings", &output.findings, true, false),
+        ("hard_cases", &output.hard_cases, true, true),
+        (
+            "dismissed_concerns",
+            &output.dismissed_concerns,
+            false,
+            true,
+        ),
+    ] {
+        for (idx, item) in items.iter().enumerate() {
+            let sids = extract_non_empty_source_ids(collection_name, idx, item, &valid_label)?;
+            for sid in sids {
+                if !all_valid.contains(&sid) {
+                    return Err(format!(
+                        "{collection_name}[{idx}].source_ids contains unknown ID '{sid}'. Valid input IDs are: {valid_label}."
+                    ));
+                }
+                if !allow_concerns && concern_ids.contains(&sid) {
+                    return Err(format!(
+                        "dismissed_concerns[{idx}].source_ids references raised concern ID '{sid}'. Raised concerns (C*) must never be placed in 'dismissed_concerns' in verification; classify any contested or questionable concern into 'hard_cases'."
+                    ));
+                }
+                if !allow_dismissed && dismissed_ids.contains(&sid) {
+                    return Err(format!(
+                        "findings[{idx}].source_ids references dismissed_concern ID '{sid}'. Category 1a 'findings' are only for uncontested raised concerns (C*); any contested issue (C* + D*) or promoted dismissal (D*) must be placed in 'hard_cases'."
+                    ));
+                }
+                accounted.insert(sid);
+            }
+        }
+    }
+
+    let missing: Vec<&str> = all_valid
+        .into_iter()
+        .filter(|id| !accounted.contains(id))
+        .collect();
+    if !missing.is_empty() {
+        return Err(format!(
+            "Verification output failed to account for input ID(s): {}. Every input concern (C*) and dismissed_concern (D*) ID must appear in 'source_ids' of at least one item in 'findings', 'hard_cases', or 'dismissed_concerns'.",
+            missing.join(", ")
+        ));
+    }
+
     Ok(())
 }
 
@@ -617,6 +732,59 @@ pub fn validate_post_verification_batch_output(
             ));
         }
     }
+    Ok(())
+}
+
+pub fn validate_post_verification_batch_items(
+    output: &PostVerificationOutput,
+    batch: &[Value],
+) -> Result<(), String> {
+    let expected_ids: Vec<&str> = batch
+        .iter()
+        .filter_map(|h| h.get("id").and_then(Value::as_str).map(str::trim))
+        .filter(|id| !id.is_empty())
+        .collect();
+    let min_items = if expected_ids.is_empty() {
+        batch.len().max(1)
+    } else {
+        1
+    };
+    validate_post_verification_batch_output(output, min_items)?;
+    if expected_ids.is_empty() {
+        return Ok(());
+    }
+
+    let valid_label = expected_ids.join(", ");
+    let mut accounted = std::collections::BTreeSet::new();
+
+    for (collection_name, items) in [
+        ("findings", &output.findings),
+        ("dismissed_concerns", &output.dismissed_concerns),
+    ] {
+        for (idx, item) in items.iter().enumerate() {
+            let sids = extract_non_empty_source_ids(collection_name, idx, item, &valid_label)?;
+            for sid in sids {
+                if !expected_ids.contains(&sid) {
+                    return Err(format!(
+                        "{collection_name}[{idx}].source_ids contains unknown hard case ID '{sid}'. Valid candidate ID(s) in this batch: {valid_label}."
+                    ));
+                }
+                accounted.insert(sid);
+            }
+        }
+    }
+
+    let missing: Vec<&str> = expected_ids
+        .into_iter()
+        .filter(|id| !accounted.contains(id))
+        .collect();
+    if !missing.is_empty() {
+        return Err(format!(
+            "post-verification output failed to account for candidate hard case ID(s): {}. Every candidate hard case ID in this batch must appear in 'source_ids' of at least one item in 'findings' or 'dismissed_concerns'.",
+            missing.join(", ")
+        ));
+    }
+
     Ok(())
 }
 
@@ -721,8 +889,16 @@ pub fn append_stage_items_with_prompts(
     prompts: &[String],
 ) {
     for item in src {
+        let next_id = format!("C{}", dest.len().saturating_add(1));
         let mut obj = item.clone();
         if let Some(map) = obj.as_object_mut() {
+            if map
+                .get("id")
+                .and_then(Value::as_str)
+                .is_none_or(|s| s.trim().is_empty())
+            {
+                map.insert("id".to_string(), json!(next_id));
+            }
             if !map.contains_key("type")
                 || map
                     .get("type")
@@ -747,8 +923,16 @@ pub fn append_stage_dismissed_concerns_with_prompts(
     prompts: &[String],
 ) {
     for item in src {
+        let next_id = format!("D{}", dest.len().saturating_add(1));
         let mut obj = item.clone();
         if let Some(map) = obj.as_object_mut() {
+            if map
+                .get("id")
+                .and_then(Value::as_str)
+                .is_none_or(|s| s.trim().is_empty())
+            {
+                map.insert("id".to_string(), json!(next_id));
+            }
             map.insert("stage".to_string(), json!(stage));
             map.insert("stages".to_string(), json!([stage]));
             map.insert("prompts".to_string(), json!(prompts));
@@ -967,6 +1151,20 @@ fn items_share_text(item: &Value, src: &Value) -> bool {
     false
 }
 
+fn extract_id_list(item: &Value, field: &str) -> Vec<String> {
+    item.get(field)
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 fn enrich_item_provenance(
     item: &mut Value,
     primary_sources: &[Value],
@@ -1000,11 +1198,28 @@ fn enrich_item_provenance(
         .chain(secondary_sources.iter())
         .collect();
 
-    let mut matched: Vec<&Value> = all_sources
-        .iter()
-        .copied()
-        .filter(|src| items_share_precise_location(item, src) || items_share_text(item, src))
-        .collect();
+    let explicit_source_ids = extract_id_list(item, "source_ids");
+    let mut matched: Vec<&Value> = if !explicit_source_ids.is_empty() {
+        all_sources
+            .iter()
+            .copied()
+            .filter(|src| {
+                src.get("id")
+                    .and_then(Value::as_str)
+                    .is_some_and(|id| explicit_source_ids.iter().any(|sid| sid == id))
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    if matched.is_empty() {
+        matched = all_sources
+            .iter()
+            .copied()
+            .filter(|src| items_share_precise_location(item, src) || items_share_text(item, src))
+            .collect();
+    }
 
     if matched.is_empty() {
         matched = all_sources
@@ -1033,10 +1248,29 @@ fn enrich_item_provenance(
         matched = fallback.iter().collect();
     }
 
+    let mut resolved_source_ids = explicit_source_ids;
+    let mut raw_source_ids = extract_id_list(item, "raw_source_ids");
+
     for g in selected_guides {
         push_unique_prompt(&mut prompts, g);
     }
+    let mut inherited_type: Option<String> = None;
     for src in matched {
+        if let Some(id) = src.get("id").and_then(Value::as_str) {
+            push_unique_string(&mut resolved_source_ids, id);
+        }
+        for raw_id in extract_id_list(src, "source_ids") {
+            push_unique_string(&mut raw_source_ids, &raw_id);
+        }
+        if inherited_type.is_none()
+            && let Some(t) = src
+                .get("type")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+        {
+            inherited_type = Some(t.to_string());
+        }
         let (src_stages, src_prompts) = extract_item_stages_and_prompts(src, stage_lookup);
         for s in src_stages {
             push_unique_string(&mut stages, &s);
@@ -1065,6 +1299,19 @@ fn enrich_item_provenance(
     }
 
     if let Some(map) = item.as_object_mut() {
+        let has_type = map
+            .get("type")
+            .and_then(Value::as_str)
+            .is_some_and(|s| !s.trim().is_empty());
+        if !has_type && let Some(t) = inherited_type {
+            map.insert("type".to_string(), json!(t));
+        }
+        if !resolved_source_ids.is_empty() {
+            map.insert("source_ids".to_string(), json!(resolved_source_ids));
+        }
+        if !raw_source_ids.is_empty() {
+            map.insert("raw_source_ids".to_string(), json!(raw_source_ids));
+        }
         if !stages.is_empty() {
             map.insert("stage".to_string(), json!(stages[0]));
             map.insert("stages".to_string(), json!(stages));
@@ -1080,27 +1327,58 @@ pub fn enrich_verification_output(
     stage_lookup: fn(&str) -> Option<&'static AnalysisStage>,
 ) {
     let read_prompts = outcome.read_prompts();
-    for finding in &mut out.findings {
+    for (idx, finding) in out.findings.iter_mut().enumerate() {
+        // Category 1a findings originate strictly from C* concerns.
         enrich_item_provenance(
             finding,
             &state.all_concerns,
-            &state.all_dismissed_concerns,
+            &[],
             &state.selected_guides,
             &read_prompts,
             stage_lookup,
         );
+        if let Some(map) = finding.as_object_mut() {
+            let vf_id = format!("VF{}", idx.saturating_add(1));
+            map.insert("id".to_string(), json!(vf_id));
+            map.insert("stage_item_id".to_string(), json!(vf_id));
+            map.insert("origin".to_string(), json!("verification"));
+        }
     }
-    for hard_case in &mut out.hard_cases {
+    for (idx, hard_case) in out.hard_cases.iter_mut().enumerate() {
+        // Category 2 hard cases can originate from both C* concerns and D* dismissals.
+        let primary_concerns = &state.all_concerns;
+        let secondary_dismissals = &state.all_dismissed_concerns;
         enrich_item_provenance(
             hard_case,
-            &state.all_concerns,
-            &state.all_dismissed_concerns,
+            primary_concerns,
+            secondary_dismissals,
             &state.selected_guides,
             &read_prompts,
             stage_lookup,
         );
+        if let Some(map) = hard_case.as_object_mut() {
+            map.insert(
+                "id".to_string(),
+                json!(format!("H{}", idx.saturating_add(1))),
+            );
+        }
     }
-    for dismissed in &mut out.dismissed_concerns {
+    let planned_batches = batch_hard_cases_by_severity(&out.hard_cases);
+    for (batch_idx, batch) in planned_batches.iter().enumerate() {
+        let assigned_stage = POST_VERIFICATION_STAGE_NAMES[batch_idx];
+        for batch_item in batch {
+            if let Some(hid) = batch_item.get("id").and_then(Value::as_str) {
+                for hc in &mut out.hard_cases {
+                    if hc.get("id").and_then(Value::as_str) == Some(hid)
+                        && let Some(map) = hc.as_object_mut()
+                    {
+                        map.insert("assigned_stage".to_string(), json!(assigned_stage));
+                    }
+                }
+            }
+        }
+    }
+    for (idx, dismissed) in out.dismissed_concerns.iter_mut().enumerate() {
         enrich_item_provenance(
             dismissed,
             &state.all_dismissed_concerns,
@@ -1109,6 +1387,13 @@ pub fn enrich_verification_output(
             &read_prompts,
             stage_lookup,
         );
+        if let Some(map) = dismissed.as_object_mut() {
+            map.insert(
+                "id".to_string(),
+                json!(format!("VD{}", idx.saturating_add(1))),
+            );
+            map.insert("origin".to_string(), json!("verification"));
+        }
     }
 }
 
@@ -1631,14 +1916,60 @@ pub fn batch_hard_cases_by_severity(hard_cases: &[Value]) -> Vec<Vec<Value>> {
     batches
 }
 
+fn mint_finding_uuid(project: &str) -> String {
+    let prefix = if project.trim().is_empty() {
+        "linux"
+    } else {
+        project.trim()
+    };
+    format!("{prefix}-{}", uuid::Uuid::new_v4())
+}
+
+/// Serializes verified `findings` for downstream prompt templates (`report`)
+/// with non-deterministic per-run UUID fields (`id` and `finding_id`) removed
+/// so `CachingAiProvider` cache keys remain deterministic across reruns.
+pub fn serialize_findings_for_prompt(findings: &[Value]) -> String {
+    let cleaned: Vec<Value> = findings
+        .iter()
+        .map(|item| {
+            let mut obj = item.clone();
+            if let Some(map) = obj.as_object_mut() {
+                map.remove("id");
+                map.remove("finding_id");
+            }
+            obj
+        })
+        .collect();
+    serde_json::to_string_pretty(&cleaned).unwrap_or_default()
+}
+
 pub(crate) fn record_verified_findings(state: &mut LinuxPatchReviewState, findings: Vec<Value>) {
-    for finding in findings {
+    for mut finding in findings {
+        let finding_id = finding
+            .get("finding_id")
+            .and_then(Value::as_str)
+            .filter(|s| !s.trim().is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| mint_finding_uuid(&state.project));
+
+        if let Some(map) = finding.as_object_mut() {
+            if let Some(existing_id) = map.get("id").and_then(Value::as_str)
+                && (existing_id.starts_with("VF") || existing_id.starts_with("PVF"))
+            {
+                map.insert("stage_item_id".to_string(), json!(existing_id));
+            }
+            map.insert("id".to_string(), json!(finding_id));
+            map.insert("finding_id".to_string(), json!(finding_id));
+        }
+
         let is_preexisting = finding
             .get("preexisting")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
         if is_preexisting {
             let mut concern = json!({
+                "id": finding_id,
+                "finding_id": finding_id,
                 "type": finding.get("problem").and_then(|v| v.as_str()).unwrap_or("Pre-existing Issue"),
                 "description": finding.get("problem").and_then(|v| v.as_str()).unwrap_or(""),
                 "reasoning": finding.get("severity_explanation").and_then(|v| v.as_str()).unwrap_or(""),
@@ -1647,14 +1978,19 @@ pub(crate) fn record_verified_findings(state: &mut LinuxPatchReviewState, findin
                 "locations": finding.get("locations").cloned().unwrap_or(json!([])),
             });
             if let Some(map) = concern.as_object_mut() {
-                if let Some(stage) = finding.get("stage").cloned() {
-                    map.insert("stage".to_string(), stage);
-                }
-                if let Some(stages) = finding.get("stages").cloned() {
-                    map.insert("stages".to_string(), stages);
-                }
-                if let Some(prompts) = finding.get("prompts").cloned() {
-                    map.insert("prompts".to_string(), prompts);
+                for key in [
+                    "stage_item_id",
+                    "source_ids",
+                    "raw_source_ids",
+                    "origin",
+                    "post_verification_stage",
+                    "stage",
+                    "stages",
+                    "prompts",
+                ] {
+                    if let Some(val) = finding.get(key).cloned() {
+                        map.insert(key.to_string(), val);
+                    }
                 }
             }
             state.concerns.push(concern);
@@ -1665,6 +2001,74 @@ pub(crate) fn record_verified_findings(state: &mut LinuxPatchReviewState, findin
             state.findings.push(finding);
         }
     }
+}
+
+pub fn apply_verification_stage_output(
+    state: &mut LinuxPatchReviewState,
+    mut out: VerificationOutput,
+    outcome: &crate::workflow::stage::StageOutcome,
+    stage_lookup: fn(&str) -> Option<&'static AnalysisStage>,
+) {
+    enrich_verification_output(state, &mut out, outcome, stage_lookup);
+    for finding in &mut out.findings {
+        let finding_id = mint_finding_uuid(&state.project);
+        if let Some(map) = finding.as_object_mut() {
+            map.insert("finding_id".to_string(), json!(finding_id));
+        }
+    }
+    state.verification_findings.extend(out.findings.clone());
+    state
+        .verification_dismissed
+        .extend(out.dismissed_concerns.clone());
+    record_verified_findings(state, out.findings);
+    state.hard_cases = out.hard_cases;
+    state
+        .deduplicated_dismissed_concerns
+        .extend(out.dismissed_concerns);
+}
+
+pub fn apply_post_verification_stage_output(
+    state: &mut LinuxPatchReviewState,
+    stage_name: &str,
+    batch: &[Value],
+    mut out: PostVerificationOutput,
+    outcome: &crate::workflow::stage::StageOutcome,
+    stage_lookup: fn(&str) -> Option<&'static AnalysisStage>,
+) {
+    enrich_post_verification_output(
+        &state.selected_guides,
+        batch,
+        &mut out,
+        outcome,
+        stage_lookup,
+    );
+    for finding in &mut out.findings {
+        let pv_idx = state.post_verification_findings.len().saturating_add(1);
+        let pvf_id = format!("PVF{pv_idx}");
+        let finding_id = mint_finding_uuid(&state.project);
+        if let Some(map) = finding.as_object_mut() {
+            map.insert("id".to_string(), json!(pvf_id));
+            map.insert("stage_item_id".to_string(), json!(pvf_id));
+            map.insert("finding_id".to_string(), json!(finding_id));
+            map.insert("origin".to_string(), json!(stage_name));
+            map.insert("post_verification_stage".to_string(), json!(stage_name));
+        }
+        state.post_verification_findings.push(finding.clone());
+    }
+    for dismissed in &mut out.dismissed_concerns {
+        let pvd_idx = state.post_verification_dismissed.len().saturating_add(1);
+        let pvd_id = format!("PVD{pvd_idx}");
+        if let Some(map) = dismissed.as_object_mut() {
+            map.insert("id".to_string(), json!(pvd_id));
+            map.insert("origin".to_string(), json!(stage_name));
+            map.insert("post_verification_stage".to_string(), json!(stage_name));
+        }
+        state.post_verification_dismissed.push(dismissed.clone());
+    }
+    record_verified_findings(state, out.findings);
+    state
+        .deduplicated_dismissed_concerns
+        .extend(out.dismissed_concerns);
 }
 
 pub fn verification_stage(
@@ -1693,15 +2097,17 @@ Aggregated Dismissed Concerns:
 {{{{aggregated_dismissed_concerns}}}}
 
 Return ONLY a JSON object with 'findings', 'hard_cases', and 'dismissed_concerns' arrays.
-- Each object in 'findings' (Category 1a: Well-Justified Concerns) MUST use the keys: "problem" (a short naming string under 80 characters, preferably starting with a subsystem prefix like 'mm:' or 'bpf:', NEVER using backquotes, using fn_name() format for functions, describing the root cause), "severity" ("Low", "Medium", "High", "Critical", or "Unknown"), "severity_explanation" (detailed reasoning and proof), "preexisting" (boolean), and "locations" (array of location objects), and may include "stages" (array of stage names that raised the merged concern) and "prompts" (array of prompt files from the merged concern).
-- Each object in 'hard_cases' (Category 2: Speculative or Contested) MUST use the keys: "type", "description", "estimated_severity" ("Low", "Medium", "High", "Critical", or "Unknown"), "signal_reason" ("mixed_signals", "speculative_concern", "speculative_dismissal", "series_interaction", or "other"), "concern_arguments" (consolidated arguments for why the bug can occur), "dismissal_arguments" (consolidated arguments/snippets from any competing or standalone dismissal, or "" if none), "verification_question" (the specific code question post-verification must answer with tools), "preexisting" (boolean), and "locations" (array of location objects), and may include "stages" and "prompts".
-- Each object in 'dismissed_concerns' (Category 1b: Well-Justified Dismissals) MUST use the keys: "type", "description", "reasoning", and "locations", and may include "stages" and "prompts".
+- LINEAGE REQUIREMENT ('source_ids'): Every input item in Aggregated Concerns has an "id" ("C1", "C2", ...) and every input item in Aggregated Dismissed Concerns has an "id" ("D1", "D2", ...). Every output object across 'findings', 'hard_cases', and 'dismissed_concerns' MUST include a non-empty "source_ids" array listing the exact input "id" string(s) merged into that item (e.g. ["C1", "D2"]). Every input "id" (all C* and D* IDs) MUST appear in at least one output item's "source_ids". Category 1a 'findings' may ONLY reference C* IDs (any contested C* + D* or promoted D* must go to 'hard_cases'), and Category 1b 'dismissed_concerns' may ONLY reference D* IDs (never C* IDs).
+- Each object in 'findings' (Category 1a: Well-Justified Concerns) MUST use the keys: "source_ids" (non-empty array of C* input IDs), "problem" (a short naming string under 80 characters, preferably starting with a subsystem prefix like 'mm:' or 'bpf:', NEVER using backquotes, using fn_name() format for functions, describing the root cause), "severity" ("Low", "Medium", "High", "Critical", or "Unknown"), "severity_explanation" (detailed reasoning and proof), "preexisting" (boolean), and "locations" (array of location objects), and may include "stages" (array of stage names that raised the merged concern) and "prompts" (array of prompt files from the merged concern).
+- Each object in 'hard_cases' (Category 2: Speculative or Contested) MUST use the keys: "source_ids" (non-empty array of input IDs), "type", "description", "estimated_severity" ("Low", "Medium", "High", "Critical", or "Unknown"), "signal_reason" ("mixed_signals", "speculative_concern", "speculative_dismissal", "series_interaction", or "other"), "concern_arguments" (consolidated arguments for why the bug can occur), "dismissal_arguments" (consolidated arguments/snippets from any competing or standalone dismissal, or "" if none), "verification_question" (the specific code question post-verification must answer with tools), "preexisting" (boolean), and "locations" (array of location objects), and may include "stages" and "prompts".
+- Each object in 'dismissed_concerns' (Category 1b: Well-Justified Dismissals) MUST use the keys: "source_ids" (non-empty array of D* input IDs), "type", "description", "reasoning", and "locations", and may include "stages" and "prompts".
 
 Example Output:
 ```json
 {{
   "findings": [
     {{
+      "source_ids": ["C1"],
       "problem": "mm: memory leak in func_x() due to unmet condition Y",
       "severity": "High",
       "severity_explanation": "1. Condition Y is met.\n2. The buffer is allocated but not freed before return.",
@@ -1719,6 +2125,7 @@ Example Output:
   ],
   "hard_cases": [
     {{
+      "source_ids": ["D1"],
       "type": "Resource Management",
       "description": "Potential leak of child node in parse_tree() on error return",
       "estimated_severity": "Medium",
@@ -1773,13 +2180,8 @@ Example Output:
             temperature,
             ..Default::default()
         })
-        .reduce_with_outcome(|state, mut out: VerificationOutput, outcome| {
-            enrich_verification_output(state, &mut out, outcome, analysis_stage_by_name);
-            record_verified_findings(state, out.findings);
-            state.hard_cases = out.hard_cases;
-            state
-                .deduplicated_dismissed_concerns
-                .extend(out.dismissed_concerns);
+        .reduce_with_outcome(|state, out: VerificationOutput, outcome| {
+            apply_verification_stage_output(state, out, outcome, analysis_stage_by_name);
         })
         .build()
 }
@@ -1790,9 +2192,9 @@ pub fn post_verification_stage(
     max_turns: usize,
     temperature: f32,
 ) -> Stage<LinuxPatchReviewState, PostVerificationOutput> {
-    let expected_items = batch.len().max(1);
     let candidate_json = serde_json::to_string_pretty(&batch).unwrap_or_default();
     let batch_for_prompts = batch.clone();
+    let batch_for_validate = batch.clone();
     let batch_for_reduce = batch;
     let series_context = series_context_placeholder(POST_VERIFICATION.wants_series_context);
     let user_template = with_series_context(
@@ -1813,14 +2215,16 @@ Candidate Hard Case(s) to Verify:
 {{{{candidate_hard_cases}}}}
 
 Return ONLY a JSON object with 'findings' and 'dismissed_concerns' arrays. Every candidate in this batch MUST be accounted for in either 'findings' (if validated) or 'dismissed_concerns' (ONLY if concrete code disproves the candidate; never return both empty arrays).
-- Each object in 'findings' MUST use: "problem" (a short naming string containing the vulnerability description. BUG NAME RULES: 1) less than 80 characters, 2) preferably start with a short subsystem prefix like 'mm:' or 'bpf:', 3) NEVER use backquotes, 4) if referring to a function, use fn_name() format, 5) try to describe the root cause instead of the consequence of the problem), "severity" (a string: Low, Medium, High, Critical, or Unknown), "severity_explanation" (a string detailing the reasoning and proof), "preexisting" (a boolean: false whenever the patch introduces, modifies, triggers, exposes, or relies on the buggy code path, caller/callee interaction, or error cleanup path, even if the underlying helper, check, or cleanup label already existed; true ONLY if the bug is in untouched code whose reachability, inputs, and behavior are completely unaffected by the reviewed patchset), "locations" (an array of objects with file, function_or_symbol, line, code_snippet, and why_this_location_matters). Carry forward the locations from the validated candidate; if you gather better evidence, replace vague locations with the most precise verified locations. Do not invent line numbers; use null when exact values are unknown.
-- Each object in 'dismissed_concerns' MUST use: "description" (the candidate issue that was disproved), "reasoning" (step-by-step explanation of how the inspected code disproves the candidate), and "locations" (a non-empty array of objects with file, function_or_symbol, line, code_snippet, and why_this_location_matters, quoting the verbatim disproving guard, lock, cleanup path, or caller/callee implementation).
+- LINEAGE REQUIREMENT ('source_ids'): Each candidate hard case in this batch has an "id" (e.g. "H1"). Every object in 'findings' and 'dismissed_concerns' MUST include a non-empty "source_ids" array listing the candidate "id"(s) from this batch that it resolves (e.g. ["H1"]), and every candidate "id" in this batch must be accounted for.
+- Each object in 'findings' MUST use: "source_ids" (non-empty array of candidate H* IDs from this batch), "problem" (a short naming string containing the vulnerability description. BUG NAME RULES: 1) less than 80 characters, 2) preferably start with a short subsystem prefix like 'mm:' or 'bpf:', 3) NEVER use backquotes, 4) if referring to a function, use fn_name() format, 5) try to describe the root cause instead of the consequence of the problem), "severity" (a string: Low, Medium, High, Critical, or Unknown), "severity_explanation" (a string detailing the reasoning and proof), "preexisting" (a boolean: false whenever the patch introduces, modifies, triggers, exposes, or relies on the buggy code path, caller/callee interaction, or error cleanup path, even if the underlying helper, check, or cleanup label already existed; true ONLY if the bug is in untouched code whose reachability, inputs, and behavior are completely unaffected by the reviewed patchset), "locations" (an array of objects with file, function_or_symbol, line, code_snippet, and why_this_location_matters). Carry forward the locations from the validated candidate; if you gather better evidence, replace vague locations with the most precise verified locations. Do not invent line numbers; use null when exact values are unknown.
+- Each object in 'dismissed_concerns' MUST use: "source_ids" (non-empty array of candidate H* IDs from this batch), "description" (the candidate issue that was disproved), "reasoning" (step-by-step explanation of how the inspected code disproves the candidate), and "locations" (a non-empty array of objects with file, function_or_symbol, line, code_snippet, and why_this_location_matters, quoting the verbatim disproving guard, lock, cleanup path, or caller/callee implementation).
 
 Example Output:
 ```json
 {{
   "findings": [
     {{
+      "source_ids": ["H1"],
       "problem": "mm: memory leak in func_x() due to unmet condition Y",
       "severity": "High",
       "severity_explanation": "1. Condition Y is met.\n2. The buffer is allocated but not freed before return.",
@@ -1838,6 +2242,7 @@ Example Output:
   ],
   "dismissed_concerns": [
     {{
+      "source_ids": ["H2"],
       "description": "Possible missing cleanup when foo_init() fails after bar_alloc().",
       "reasoning": "Inspecting caller_fn() confirms bar_free() is unconditionally invoked in the err_out cleanup path.",
       "locations": [
@@ -1871,7 +2276,7 @@ Example Output:
         .output_format(
             OutputFormat::json()
                 .with_validator(move |out, _state| {
-                    validate_post_verification_batch_output(out, expected_items)
+                    validate_post_verification_batch_items(out, &batch_for_validate)
                 })
                 .with_feedback_formatter(format_post_verification_feedback),
         )
@@ -1881,18 +2286,15 @@ Example Output:
             temperature,
             ..Default::default()
         })
-        .reduce_with_outcome(move |state, mut out: PostVerificationOutput, outcome| {
-            enrich_post_verification_output(
-                &state.selected_guides,
+        .reduce_with_outcome(move |state, out: PostVerificationOutput, outcome| {
+            apply_post_verification_stage_output(
+                state,
+                stage_name,
                 &batch_for_reduce,
-                &mut out,
+                out,
                 outcome,
                 analysis_stage_by_name,
             );
-            record_verified_findings(state, out.findings);
-            state
-                .deduplicated_dismissed_concerns
-                .extend(out.dismissed_concerns);
         })
         .build()
 }
@@ -1941,7 +2343,7 @@ Return raw text output, not JSON."#
             ))
             .include_file("inline-template.md")
             .with_var("findings", |s: &LinuxPatchReviewState| {
-                serde_json::to_string_pretty(&s.findings).unwrap_or_default()
+                serialize_findings_for_prompt(&s.findings)
             }),
         )
         .output_format(OutputFormat::text_with_validator(
@@ -2912,6 +3314,7 @@ mod tests {
         // calls where one call succeeds and another fails, verifying that a failed call
         // does not drop a sibling successful call sharing the same tool_call_id.
         let outcome = crate::workflow::stage::StageOutcome {
+            skipped: false,
             tokens_in: 10,
             tokens_out: 10,
             tokens_cached: 0,
@@ -3123,5 +3526,236 @@ mod tests {
             ])
         );
         let _ = &mut ver_out;
+    }
+
+    #[test]
+    fn test_lineage_ids_validators_and_uuid_minting() {
+        let mut state = LinuxPatchReviewState {
+            project: "linux".to_string(),
+            ..Default::default()
+        };
+        append_stage_items_with_prompts(
+            &mut state.all_concerns,
+            &[
+                json!({"description": "concern one", "reasoning": "r1", "locations": []}),
+                json!({"description": "concern two", "reasoning": "r2", "locations": []}),
+            ],
+            "goal",
+            "General",
+            &["review-core.md".to_string()],
+        );
+        append_stage_dismissed_concerns_with_prompts(
+            &mut state.all_dismissed_concerns,
+            &[json!({"description": "dismissed one", "reasoning": "d1", "locations": []})],
+            "locking",
+            &["subsystem/locking.md".to_string()],
+        );
+
+        assert_eq!(state.all_concerns[0]["id"], "C1");
+        assert_eq!(state.all_concerns[1]["id"], "C2");
+        assert_eq!(state.all_dismissed_concerns[0]["id"], "D1");
+
+        let proof_loc = json!([{
+            "file": "net/core/dev.c",
+            "function_or_symbol": "foo",
+            "line": 10,
+            "code_snippet": "if (!ptr) return;"
+        }]);
+
+        // Missing C2 in source_ids must be rejected.
+        let incomplete_ver = VerificationOutput {
+            findings: vec![json!({
+                "source_ids": ["C1"],
+                "problem": "net: bug one",
+                "severity": "High",
+                "severity_explanation": "explain",
+                "preexisting": false,
+                "locations": []
+            })],
+            hard_cases: vec![],
+            dismissed_concerns: vec![json!({
+                "source_ids": ["D1"],
+                "type": "Locking",
+                "description": "dismissed one",
+                "reasoning": "d1",
+                "locations": proof_loc
+            })],
+        };
+        let err = validate_verification_stage_output(&incomplete_ver, &state).unwrap_err();
+        assert!(err.contains("C2"));
+
+        // Putting a C* ID in Category 1b dismissed_concerns must be rejected.
+        let illegal_1b = VerificationOutput {
+            findings: vec![json!({
+                "source_ids": ["C1"],
+                "problem": "net: bug one",
+                "severity": "High",
+                "severity_explanation": "explain",
+                "preexisting": false,
+                "locations": []
+            })],
+            hard_cases: vec![],
+            dismissed_concerns: vec![json!({
+                "source_ids": ["C2", "D1"],
+                "type": "Locking",
+                "description": "dismissed one",
+                "reasoning": "d1",
+                "locations": proof_loc
+            })],
+        };
+        let err = validate_verification_stage_output(&illegal_1b, &state).unwrap_err();
+        assert!(err.contains("C2"));
+
+        // Putting D1 into Category 1a findings is rejected.
+        let illegal_1a = VerificationOutput {
+            findings: vec![json!({
+                "source_ids": ["C1", "D1"],
+                "problem": "net: bug one",
+                "severity": "High",
+                "severity_explanation": "explain",
+                "preexisting": false,
+                "locations": []
+            })],
+            hard_cases: vec![json!({
+                "source_ids": ["C2"],
+                "type": "Bug",
+                "description": "concern two",
+                "estimated_severity": "Medium",
+                "signal_reason": "speculative_concern",
+                "concern_arguments": "r2",
+                "dismissal_arguments": "",
+                "verification_question": "verify c2",
+                "preexisting": false,
+                "locations": []
+            })],
+            dismissed_concerns: vec![],
+        };
+        let err = validate_verification_stage_output(&illegal_1a, &state).unwrap_err();
+        assert!(err.contains("D1") || err.contains("dismissed_concerns"));
+
+        // Complete valid verification output succeeds and stamps VF1, H1, VD1, and UUID.
+        let valid_ver = VerificationOutput {
+            findings: vec![json!({
+                "source_ids": ["C1"],
+                "problem": "net: bug one",
+                "severity": "High",
+                "severity_explanation": "explain",
+                "preexisting": false,
+                "locations": []
+            })],
+            hard_cases: vec![json!({
+                "source_ids": ["C2"],
+                "type": "Bug",
+                "description": "concern two",
+                "estimated_severity": "Medium",
+                "signal_reason": "speculative_concern",
+                "concern_arguments": "r2",
+                "dismissal_arguments": "",
+                "verification_question": "verify c2",
+                "preexisting": false,
+                "locations": []
+            })],
+            dismissed_concerns: vec![json!({
+                "source_ids": ["D1"],
+                "type": "Locking",
+                "description": "dismissed one",
+                "reasoning": "d1",
+                "locations": proof_loc
+            })],
+        };
+        assert!(validate_verification_stage_output(&valid_ver, &state).is_ok());
+
+        apply_verification_stage_output(
+            &mut state,
+            valid_ver,
+            &crate::workflow::stage::StageOutcome::default(),
+            analysis_stage_by_name,
+        );
+        assert_eq!(state.verification_findings[0]["id"], "VF1");
+        assert!(
+            state.verification_findings[0]["finding_id"]
+                .as_str()
+                .unwrap()
+                .starts_with("linux-")
+        );
+        assert_eq!(state.hard_cases[0]["id"], "H1");
+        assert_eq!(state.hard_cases[0]["assigned_stage"], "post-verification-1");
+        assert_eq!(state.verification_dismissed[0]["id"], "VD1");
+        assert_eq!(
+            state.findings[0]["id"],
+            state.verification_findings[0]["finding_id"]
+        );
+
+        // Post-verification validator checks H1 coverage.
+        let batch = state.hard_cases.clone();
+        let bad_pv = PostVerificationOutput {
+            findings: vec![json!({
+                "source_ids": ["H99"],
+                "problem": "net: bug two",
+                "severity": "Medium",
+                "severity_explanation": "explain",
+                "preexisting": false,
+                "locations": []
+            })],
+            dismissed_concerns: vec![],
+        };
+        assert!(validate_post_verification_batch_items(&bad_pv, &batch).is_err());
+
+        // Merging multiple hard cases (H1, H2) in a single batch into one finding is valid.
+        let two_hard_cases = vec![
+            json!({"id": "H1", "source_ids": ["C1"]}),
+            json!({"id": "H2", "source_ids": ["C2"]}),
+        ];
+        let merged_pv = PostVerificationOutput {
+            findings: vec![json!({
+                "source_ids": ["H1", "H2"],
+                "problem": "net: merged bug",
+                "severity": "Medium",
+                "severity_explanation": "explain",
+                "preexisting": false,
+                "locations": []
+            })],
+            dismissed_concerns: vec![],
+        };
+        assert!(validate_post_verification_batch_items(&merged_pv, &two_hard_cases).is_ok());
+
+        let good_pv = PostVerificationOutput {
+            findings: vec![json!({
+                "source_ids": ["H1"],
+                "problem": "net: bug two",
+                "severity": "Medium",
+                "severity_explanation": "explain",
+                "preexisting": false,
+                "locations": []
+            })],
+            dismissed_concerns: vec![],
+        };
+        assert!(validate_post_verification_batch_items(&good_pv, &batch).is_ok());
+
+        apply_post_verification_stage_output(
+            &mut state,
+            "post-verification-1",
+            &batch,
+            good_pv,
+            &crate::workflow::stage::StageOutcome::default(),
+            analysis_stage_by_name,
+        );
+        assert_eq!(state.post_verification_findings[0]["id"], "PVF1");
+        assert_eq!(
+            state.post_verification_findings[0]["raw_source_ids"],
+            json!(["C2"])
+        );
+        assert_eq!(state.findings.len(), 2);
+        assert!(
+            state.findings[1]["finding_id"]
+                .as_str()
+                .unwrap()
+                .starts_with("linux-")
+        );
+        let prompt_findings = serialize_findings_for_prompt(&state.findings);
+        assert!(!prompt_findings.contains("\"finding_id\""));
+        assert!(!prompt_findings.contains("\"id\""));
+        assert!(prompt_findings.contains("\"stage_item_id\": \"VF1\""));
+        assert!(prompt_findings.contains("\"stage_item_id\": \"PVF1\""));
     }
 }

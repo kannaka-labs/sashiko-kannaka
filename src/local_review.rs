@@ -733,6 +733,37 @@ fn mark_patch_review_incomplete(patches: &mut [Value], patch_index: i64, error: 
     }
 }
 
+/// Offsets `log_start` and `log_end` on each stage in `review_map` by
+/// `history_offset` so stage transcript bounds align with `combined_history`.
+fn offset_review_map_log_bounds(map: &Value, history_offset: usize) -> Value {
+    let offset = u64::try_from(history_offset).unwrap_or(u64::MAX);
+    if offset == 0 {
+        return map.clone();
+    }
+    let mut adjusted = map.clone();
+    if let Some(stages) = adjusted.get_mut("stages").and_then(Value::as_array_mut) {
+        for stage in stages {
+            if let Some(start) = stage.get("log_start").and_then(Value::as_u64) {
+                stage["log_start"] = json!(start.saturating_add(offset));
+            }
+            if let Some(end) = stage.get("log_end").and_then(Value::as_u64) {
+                stage["log_end"] = json!(end.saturating_add(offset));
+            }
+        }
+    }
+    adjusted
+}
+
+fn attach_patch_review_map(patches: &mut [Value], patch_index: i64, review_map: Value) {
+    if let Some(patch) = patches
+        .iter_mut()
+        .find(|patch| patch["index"].as_i64() == Some(patch_index))
+        && let Some(fields) = patch.as_object_mut()
+    {
+        fields.insert("review_map".into(), review_map);
+    }
+}
+
 /// Assembles the combined review payload for a review.
 ///
 /// Pre-existing concerns are preserved in the payload so that daemon-spawned
@@ -745,15 +776,22 @@ fn build_review_output(
     dismissed_concerns: Vec<Value>,
     concerns_count: u64,
     dismissed_concerns_count: u64,
+    review_map: Option<Value>,
 ) -> Value {
-    json!({
+    let mut out = json!({
         "summary": summary,
         "findings": findings,
         "concerns": concerns,
         "dismissed_concerns": dismissed_concerns,
         "concerns_count": concerns_count,
         "dismissed_concerns_count": dismissed_concerns_count
-    })
+    });
+    if let Some(map) = review_map
+        && let Some(obj) = out.as_object_mut()
+    {
+        obj.insert("review_map".to_string(), map);
+    }
+    out
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -991,16 +1029,22 @@ async fn run_worker_in_worktree(
     let mut buffered = futures_stream.buffer_unordered(concurrency);
     let mut results = Vec::new();
     let mut review_errors = Vec::new();
+    let mut failed_outcomes = Vec::new();
     while let Some((patch_index, result)) = buffered.next().await {
         match result {
             Ok(res) => results.push(res),
             Err(err) => {
+                if let Some(wf) = err.downcast_ref::<crate::workflow::WorkflowFailure>() {
+                    failed_outcomes.push((patch_index, wf.outcome.clone()));
+                }
                 let err = err.to_string();
                 mark_patch_review_incomplete(&mut patch_results, patch_index, &err);
                 review_errors.push((patch_index, err));
             }
         }
     }
+    results.sort_by_key(|res| res["patch_index"].as_i64().unwrap_or(0));
+    failed_outcomes.sort_by_key(|(idx, _)| *idx);
 
     // Aggregate findings, inline reviews, history, input context, and concern counts
     let mut combined_summary = String::new();
@@ -1010,14 +1054,27 @@ async fn run_worker_in_worktree(
     let mut combined_inline = String::new();
     let mut combined_history = Vec::new();
     let mut combined_input_context = String::new();
-    let mut total_tokens_in = 0;
-    let mut total_tokens_out = 0;
-    let mut total_tokens_cached = 0;
-    let mut total_concerns_count = 0;
-    let mut total_dismissed_concerns_count = 0;
+    let mut single_review_map = None;
+    let mut total_tokens_in: u64 = 0;
+    let mut total_tokens_out: u64 = 0;
+    let mut total_tokens_cached: u64 = 0;
+    let mut total_concerns_count: u64 = 0;
+    let mut total_dismissed_concerns_count: u64 = 0;
+
+    for (_idx, failed) in failed_outcomes {
+        total_tokens_in = total_tokens_in.saturating_add(u64::from(failed.tokens_in));
+        total_tokens_out = total_tokens_out.saturating_add(u64::from(failed.tokens_out));
+        total_tokens_cached = total_tokens_cached.saturating_add(u64::from(failed.tokens_cached));
+        for msg in failed.history {
+            if let Ok(val) = serde_json::to_value(msg) {
+                combined_history.push(val);
+            }
+        }
+    }
 
     for res in results {
         let p_idx = res["patch_index"].as_i64().unwrap_or(0);
+        let history_offset = combined_history.len();
         let patch_subject = patches_to_review
             .iter()
             .find(|p| p.index == p_idx)
@@ -1059,13 +1116,20 @@ async fn run_worker_in_worktree(
             }
 
             if let Some(cc) = review.get("concerns_count").and_then(|v| v.as_u64()) {
-                total_concerns_count += cc;
+                total_concerns_count = total_concerns_count.saturating_add(cc);
             }
             if let Some(dcc) = review
                 .get("dismissed_concerns_count")
                 .and_then(|v| v.as_u64())
             {
-                total_dismissed_concerns_count += dcc;
+                total_dismissed_concerns_count = total_dismissed_concerns_count.saturating_add(dcc);
+            }
+            if let Some(map) = review.get("review_map").filter(|v| !v.is_null()) {
+                let adjusted_map = offset_review_map_log_bounds(map, history_offset);
+                attach_patch_review_map(&mut patch_results, p_idx, adjusted_map.clone());
+                if patches_to_review.len() == 1 {
+                    single_review_map = Some(adjusted_map);
+                }
             }
         }
 
@@ -1096,9 +1160,10 @@ async fn run_worker_in_worktree(
             combined_input_context.push_str(inp);
         }
 
-        total_tokens_in += res["tokens_in"].as_u64().unwrap_or(0);
-        total_tokens_out += res["tokens_out"].as_u64().unwrap_or(0);
-        total_tokens_cached += res["tokens_cached"].as_u64().unwrap_or(0);
+        total_tokens_in = total_tokens_in.saturating_add(res["tokens_in"].as_u64().unwrap_or(0));
+        total_tokens_out = total_tokens_out.saturating_add(res["tokens_out"].as_u64().unwrap_or(0));
+        total_tokens_cached =
+            total_tokens_cached.saturating_add(res["tokens_cached"].as_u64().unwrap_or(0));
     }
 
     let review_output = build_review_output(
@@ -1108,6 +1173,7 @@ async fn run_worker_in_worktree(
         combined_dismissed_concerns,
         total_concerns_count,
         total_dismissed_concerns_count,
+        single_review_map,
     );
 
     let mut combined_result = json!({
@@ -1261,10 +1327,26 @@ pub fn format_agent_review_output(result: &Value) -> Value {
         "clean"
     };
 
+    let patches: Vec<Value> = result
+        .get("patches")
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .map(|p| {
+                    let mut p_val = p.clone();
+                    if let Some(map) = p_val.as_object_mut() {
+                        map.remove("review_map");
+                    }
+                    p_val
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
     let mut out = json!({
         "status": status,
         "baseline": result.get("baseline").cloned().unwrap_or(Value::Null),
-        "patches": result.get("patches").cloned().unwrap_or_else(|| json!([])),
+        "patches": patches,
         "findings": findings,
         "concerns": concerns,
         "tokens_in": result.get("tokens_in").and_then(|v| v.as_u64()).unwrap_or(0),
@@ -2124,6 +2206,17 @@ mod tests {
 
     #[test]
     fn test_local_review_output_preserves_preexisting_concerns() {
+        let single_map = json!({
+            "version": 1,
+            "project": "sashiko",
+            "prompts": {"base": ["review-core.md"], "pre_screen": [], "stage_guides": {}, "tool_read": []},
+            "stages": [{"name": "pre-screen", "log_start": 0, "log_end": 2}],
+            "raw_concerns": [{"id": "C1"}],
+            "raw_dismissed_concerns": [],
+            "verification": {"findings": [], "hard_cases": [], "dismissed_concerns": []},
+            "post_verification": {"findings": [], "dismissed_concerns": []},
+            "threads": [{"thread_id": "T1"}],
+        });
         let output = build_review_output(
             "Adds dev-queue routing heuristic.".to_string(),
             vec![json!({"problem": "new regression"})],
@@ -2131,14 +2224,24 @@ mod tests {
             vec![],
             3,
             0,
+            Some(offset_review_map_log_bounds(&single_map, 0)),
         );
 
-        // Pre-existing candidates and summary must be preserved so daemon-spawned worker reviews
-        // store the summary and hand concerns to the standalone Linux bug pipeline.
+        // Pre-existing candidates, summary, and review_map must be preserved so daemon-spawned
+        // worker reviews store them in ai_interactions.output.
         assert_eq!(output["summary"], "Adds dev-queue routing heuristic.");
         assert_eq!(output["concerns"].as_array().unwrap().len(), 1);
         assert_eq!(output["concerns_count"], 3);
         assert_eq!(output["findings"].as_array().unwrap().len(), 1);
+        assert_eq!(output["review_map"], single_map);
+
+        let mut patches = vec![json!({"index": 1}), json!({"index": 2})];
+        let adjusted = offset_review_map_log_bounds(&single_map, 4);
+        attach_patch_review_map(&mut patches, 2, adjusted);
+        assert_eq!(patches[1]["review_map"]["project"], "sashiko");
+        assert_eq!(patches[1]["review_map"]["raw_concerns"][0]["id"], "C1");
+        assert_eq!(patches[1]["review_map"]["stages"][0]["log_start"], 4);
+        assert_eq!(patches[1]["review_map"]["stages"][0]["log_end"], 6);
     }
 
     #[test]

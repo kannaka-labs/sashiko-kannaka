@@ -30,11 +30,11 @@ use crate::workflows::linux_patch_review::{
     AnalysisStage, ConsolidationStage, LinuxPatchReviewState, POST_VERIFICATION_STAGE_NAMES,
     PlanningOutput, PostVerificationOutput, PrescreenOutput, SERIES_CONTEXT_PLACEHOLDER,
     StageConcernsOutput, VerificationOutput, append_stage_dismissed_concerns_with_prompts,
-    append_stage_items_with_prompts, batch_hard_cases_by_severity, collect_stage_prompts,
-    enrich_post_verification_output, enrich_verification_output, extra_prompt_paths_for_items,
-    extra_prompt_paths_for_state, format_post_verification_feedback,
-    format_verification_stage_feedback, has_valid_proof_location, record_verified_findings,
-    validate_post_verification_batch_output, validate_verification_stage_output,
+    append_stage_items_with_prompts, apply_post_verification_stage_output,
+    apply_verification_stage_output, batch_hard_cases_by_severity, collect_stage_prompts,
+    extra_prompt_paths_for_items, extra_prompt_paths_for_state, format_post_verification_feedback,
+    format_verification_stage_feedback, has_valid_proof_location, serialize_findings_for_prompt,
+    validate_post_verification_batch_items, validate_verification_stage_output,
 };
 
 /// State container for a Sashiko patch review run.
@@ -136,7 +136,7 @@ You are a principal engineer evaluating the high-level intent, architectural sou
   2. No Unrelated Changes (Single Responsibility): Does the commit contain unrelated changes, drive-by edits, or mixed concerns? It must NOT — each commit must implement one consistent, self-sufficient change. Flag commits that bundle unrelated changes that should be split into separate commits.
   3. Problem Validity & Worth: Is the problem real and worth solving? Flag over-engineered solutions to hypothetical or non-existent problems, or changes whose complexity outweighs their benefit.
   4. Solution Optimality & Alternatives: Is the chosen solution the best engineering approach, or are there obviously simpler, safer, or more idiomatic alternatives? If a clearly superior alternative exists, raise a concern explaining why.
-- Benchmark Backing for Linux Review-Quality Changes (HIGH Severity): Do NOT demand benchmark data, measurements, or manual test procedures in commit messages for ordinary code, CLI, UI, or bug-fix commits where correctness is clear, nor for changes to Sashiko's own self-review prompts (`prompts/sashiko/`, `sashiko_patch_review.rs`), nor for post-triage maintenance tasks (such as periodic upstream fix checks on already-triaged open bugs) or filtering pre-existing issues out of patch review reports that are not exercised by the patch-review or initial bug-discovery benchmark suites (`benchmarks/`). Furthermore, NEVER report that a prompt or workflow commit failed to modify or add files in the `benchmarks/` directory (`benchmarks/*.json` are static ground-truth corpora of known positive bugs and do not store negative/false-positive test cases). However, if a change can meaningfully affect overall Linux AI patch-review or initial bug-discovery quality across the board (such as `third_party/prompts/`, `linux_patch_review.rs`, `linux_bug.rs` discovery/verification/deduplication stages, generic workflow graph structure, model parameters, or shared verification/deduplication rules), its commit message MUST include validation evidence (either benchmark evaluation results or, for targeted false-positive prompt refinements, local re-review results on the affected Linux patches/series). Only if such a Linux review-quality change provides neither benchmark results nor targeted patch re-review results in the commit message, flag it as a High severity issue.
+- Benchmark Backing for Linux Review-Quality Changes (HIGH Severity): Do NOT demand benchmark data, measurements, or manual test procedures in commit messages for ordinary code, CLI, UI, or bug-fix commits where correctness is clear, nor for changes to Sashiko's own self-review prompts (`prompts/sashiko/`, `sashiko_patch_review.rs`), nor for structural lineage/provenance ID bookkeeping (`source_ids`, `finding_id`, `review_map`) or telemetry plumbing that preserves bug-detection heuristics, nor for post-triage maintenance tasks (such as periodic upstream fix checks on already-triaged open bugs) or filtering pre-existing issues out of patch review reports that are not exercised by the patch-review or initial bug-discovery benchmark suites (`benchmarks/`). Furthermore, NEVER report that a prompt or workflow commit failed to modify or add files in the `benchmarks/` directory (`benchmarks/*.json` are static ground-truth corpora of known positive bugs and do not store negative/false-positive test cases). However, if a change can meaningfully affect overall Linux AI patch-review or initial bug-discovery quality across the board (such as `third_party/prompts/`, `linux_patch_review.rs` bug-detection or classification heuristics, `linux_bug.rs` discovery/verification/deduplication stages, generic workflow graph structure, model parameters, or shared verification/deduplication rules), its commit message MUST include validation evidence (either benchmark evaluation results or, for targeted false-positive prompt refinements, local re-review results on the affected Linux patches/series). Only if such a Linux review-quality change provides neither benchmark results nor targeted patch re-review results in the commit message, flag it as a High severity issue.
 - Unix-Only Target Environment: Sashiko exclusively targets Linux/Unix environments. NEVER report non-Unix or Windows compilation/portability issues (such as `tokio::signal::unix`, `rustix`, `/dev/ptmx`, `libc`, or POSIX signals/paths) as concerns.
 - Never Vibe-Guess Build or Compilation Bugs: Build verification (`cargo check`, `cargo test`, `cargo clippy`) is deterministic. NEVER report alleged build failures, syntax errors, missing imports (`use`), unresolved symbols/types/methods/macros, type mismatches, missing trait bounds, borrow-checker/lifetime errors, or Cargo build issues.
 - Global UX & Regressions: If the change can affect the user experience globally (CLI ergonomics, review output clarity/false-positive rate, progress display, or web UI/API behavior), apply maximum scrutiny and reject regressions.
@@ -950,9 +950,10 @@ Aggregated Dismissed Concerns:
 {{{{aggregated_dismissed_concerns}}}}
 
 Return ONLY a JSON object with 'findings', 'hard_cases', and 'dismissed_concerns' arrays.
-- Each object in 'findings' (Category 1a: Well-Justified Concerns) MUST use the keys: "problem" (a short naming string under 80 characters starting with a Sashiko component prefix like 'workflow:', 'db:', 'reviewer:', 'toolbox:', 'api:', 'cli:', NEVER using backquotes), "severity" ("Low", "Medium", "High", "Critical", or "Unknown"), "severity_explanation" (detailed reasoning and proof), "preexisting" (boolean), and "locations" (array of objects with file, function_or_symbol, line, code_snippet, and why_this_location_matters), and may include "stages" (array of stage names) and "prompts" (array of prompt files).
-- Each object in 'hard_cases' (Category 2: Speculative or Contested) MUST use the keys: "type", "description", "estimated_severity" ("Low", "Medium", "High", "Critical", or "Unknown"), "signal_reason" ("mixed_signals", "speculative_concern", "speculative_dismissal", "series_interaction", or "other"), "concern_arguments" (consolidated arguments for why the bug can occur), "dismissal_arguments" (consolidated arguments/snippets from any competing or standalone dismissal, or "" if none), "verification_question" (the specific code question post-verification must answer with tools), "preexisting" (boolean), and "locations" (array of location objects), and may include "stages" and "prompts".
-- Each object in 'dismissed_concerns' (Category 1b: Well-Justified Dismissals) MUST use the keys: "type", "description", "reasoning", and "locations", and may include "stages" and "prompts"."#
+- LINEAGE REQUIREMENT ('source_ids'): Every item in Aggregated Concerns has an "id" ("C1", "C2", ...) and every item in Aggregated Dismissed Concerns has an "id" ("D1", "D2", ...). Every object in 'findings', 'hard_cases', and 'dismissed_concerns' MUST include a non-empty "source_ids" array of strings listing the exact input "C*" and/or "D*" IDs consolidated into that output item. Every input "C*" and "D*" ID MUST appear in at least one output item's "source_ids". Category 1a 'findings' may ONLY reference "C*" IDs (any contested "C*" + "D*" or promoted "D*" must be routed to 'hard_cases'), and Category 1b 'dismissed_concerns' may ONLY reference "D*" IDs in "source_ids" (never "C*" IDs).
+- Each object in 'findings' (Category 1a: Well-Justified Concerns) MUST use the keys: "source_ids" (non-empty array of "C*" IDs only), "problem" (a short naming string under 80 characters starting with a Sashiko component prefix like 'workflow:', 'db:', 'reviewer:', 'toolbox:', 'api:', 'cli:', NEVER using backquotes), "severity" ("Low", "Medium", "High", "Critical", or "Unknown"), "severity_explanation" (detailed reasoning and proof), "preexisting" (boolean), and "locations" (array of objects with file, function_or_symbol, line, code_snippet, and why_this_location_matters), and may include "stages" (array of stage names) and "prompts" (array of prompt files).
+- Each object in 'hard_cases' (Category 2: Speculative or Contested) MUST use the keys: "source_ids" (non-empty array of input IDs), "type", "description", "estimated_severity" ("Low", "Medium", "High", "Critical", or "Unknown"), "signal_reason" ("mixed_signals", "speculative_concern", "speculative_dismissal", "series_interaction", or "other"), "concern_arguments" (consolidated arguments for why the bug can occur), "dismissal_arguments" (consolidated arguments/snippets from any competing or standalone dismissal, or "" if none), "verification_question" (the specific code question post-verification must answer with tools), "preexisting" (boolean), and "locations" (array of location objects), and may include "stages" and "prompts".
+- Each object in 'dismissed_concerns' (Category 1b: Well-Justified Dismissals) MUST use the keys: "source_ids" (non-empty array of "D*" IDs only), "type", "description", "reasoning", and "locations", and may include "stages" and "prompts"."#
         ))
         .include_file("false-positive-guide.md")
         .include_file("severity.md")
@@ -986,13 +987,8 @@ Return ONLY a JSON object with 'findings', 'hard_cases', and 'dismissed_concerns
             ..Default::default()
         })
         .skip_if(|s| s.all_concerns.is_empty() && s.all_dismissed_concerns.is_empty())
-        .reduce_with_outcome(|state, mut out: VerificationOutput, outcome| {
-            enrich_verification_output(state, &mut out, outcome, analysis_stage_by_name);
-            record_verified_findings(state, out.findings);
-            state.hard_cases = out.hard_cases;
-            state
-                .deduplicated_dismissed_concerns
-                .extend(out.dismissed_concerns);
+        .reduce_with_outcome(|state, out: VerificationOutput, outcome| {
+            apply_verification_stage_output(state, out, outcome, analysis_stage_by_name);
         })
         .build()
 }
@@ -1003,9 +999,9 @@ pub fn post_verification_stage(
     max_turns: usize,
     temperature: f32,
 ) -> Stage<SashikoPatchReviewState, PostVerificationOutput> {
-    let expected_items = batch.len().max(1);
     let candidate_json = serde_json::to_string_pretty(&batch).unwrap_or_default();
     let batch_for_prompts = batch.clone();
+    let batch_for_validate = batch.clone();
     let batch_for_reduce = batch;
     let series_context = series_context_placeholder(POST_VERIFICATION.wants_series_context);
     let user_template = with_series_context(
@@ -1026,8 +1022,9 @@ Candidate Hard Case(s) to Verify:
 {{{{candidate_hard_cases}}}}
 
 Return ONLY a JSON object with 'findings' and 'dismissed_concerns' arrays. Every candidate in this batch MUST be accounted for in either 'findings' (if validated) or 'dismissed_concerns' (if disproved by concrete code or excluded by rules 1-2; never return both empty arrays).
-- Each object in 'findings' MUST use: "problem" (a short naming string under 80 characters starting with a Sashiko component prefix like 'workflow:', 'db:', 'reviewer:', 'toolbox:', 'api:', 'cli:', NEVER using backquotes), "severity" (Low, Medium, High, Critical, or Unknown), "severity_explanation" (detailed reasoning and proof), "preexisting" (boolean), "locations" (array of objects with file, function_or_symbol, line, code_snippet, and why_this_location_matters).
-- Each object in 'dismissed_concerns' MUST use: "description" (the candidate issue that was disproved), "reasoning" (step-by-step explanation of how the inspected code or policy rule disproves the candidate), and "locations" (a non-empty array of objects with file, function_or_symbol, line, code_snippet, and why_this_location_matters, quoting the verbatim disproving code or target snippet)."#
+- LINEAGE REQUIREMENT ('source_ids'): Every candidate hard case in this batch has an "id" ("H1", "H2", ...). Every object in 'findings' and 'dismissed_concerns' MUST include a non-empty "source_ids" array of strings listing the exact candidate "H*" ID(s) from this batch that it resolves, and every candidate "H*" ID in this batch MUST be accounted for in at least one output item's "source_ids".
+- Each object in 'findings' MUST use: "source_ids" (non-empty array of batch "H*" IDs), "problem" (a short naming string under 80 characters starting with a Sashiko component prefix like 'workflow:', 'db:', 'reviewer:', 'toolbox:', 'api:', 'cli:', NEVER using backquotes), "severity" (Low, Medium, High, Critical, or Unknown), "severity_explanation" (detailed reasoning and proof), "preexisting" (boolean), "locations" (array of objects with file, function_or_symbol, line, code_snippet, and why_this_location_matters).
+- Each object in 'dismissed_concerns' MUST use: "source_ids" (non-empty array of batch "H*" IDs), "description" (the candidate issue that was disproved), "reasoning" (step-by-step explanation of how the inspected code or policy rule disproves the candidate), and "locations" (a non-empty array of objects with file, function_or_symbol, line, code_snippet, and why_this_location_matters, quoting the verbatim disproving code or target snippet)."#
         ))
         .include_file("false-positive-guide.md")
         .include_file("severity.md")
@@ -1047,7 +1044,7 @@ Return ONLY a JSON object with 'findings' and 'dismissed_concerns' arrays. Every
             OutputFormat::json()
                 .with_validator(
                     move |out: &PostVerificationOutput, _: &SashikoPatchReviewState| {
-                        validate_post_verification_batch_output(out, expected_items)
+                        validate_post_verification_batch_items(out, &batch_for_validate)
                     },
                 )
                 .with_feedback_formatter(format_post_verification_feedback),
@@ -1058,18 +1055,15 @@ Return ONLY a JSON object with 'findings' and 'dismissed_concerns' arrays. Every
             temperature,
             ..Default::default()
         })
-        .reduce_with_outcome(move |state, mut out: PostVerificationOutput, outcome| {
-            enrich_post_verification_output(
-                &state.selected_guides,
+        .reduce_with_outcome(move |state, out: PostVerificationOutput, outcome| {
+            apply_post_verification_stage_output(
+                state,
+                stage_name,
                 &batch_for_reduce,
-                &mut out,
+                out,
                 outcome,
                 analysis_stage_by_name,
             );
-            record_verified_findings(state, out.findings);
-            state
-                .deduplicated_dismissed_concerns
-                .extend(out.dismissed_concerns);
         })
         .build()
 }
@@ -1122,7 +1116,7 @@ Return strictly plain text output (no markdown, no backticks, wrapped at 78 char
             ))
             .include_file("github-summary-template.md")
             .with_var("findings", |s: &SashikoPatchReviewState| {
-                serde_json::to_string_pretty(&s.findings).unwrap_or_default()
+                serialize_findings_for_prompt(&s.findings)
             }),
         )
         .output_format(OutputFormat::text_with_validator(
@@ -1221,6 +1215,7 @@ pub fn build_sashiko_patch_review_workflow_with_options(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::workflows::linux_patch_review::validate_post_verification_batch_output;
 
     #[test]
     fn test_sashiko_analysis_stages_table() {
