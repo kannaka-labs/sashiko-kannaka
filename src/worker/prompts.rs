@@ -353,8 +353,13 @@ impl Worker {
             planned_stages: Vec::new(),
             skip_report: self.skip_report,
             report_preexisting: self.report_preexisting,
+            project: self.project.as_str().to_string(),
             all_concerns: Vec::new(),
             all_dismissed_concerns: Vec::new(),
+            verification_findings: Vec::new(),
+            verification_dismissed: Vec::new(),
+            post_verification_findings: Vec::new(),
+            post_verification_dismissed: Vec::new(),
             deduplicated_dismissed_concerns: Vec::new(),
             hard_cases: Vec::new(),
             concerns: Vec::new(),
@@ -472,8 +477,16 @@ impl Worker {
             }
         };
 
+        let history_offset = self.global_history.len();
         let outcome = WorkflowEngine::execute(&workflow, &env, &mut state, Some(&event_cb)).await?;
         self.global_history.extend(outcome.history.clone());
+
+        let review_map = crate::workflows::review_map::build_review_map(
+            self.project,
+            &state,
+            &outcome.stage_runs,
+            history_offset,
+        );
 
         let concerns_count = state.all_concerns.len();
         let dismissed_concerns = if !state.deduplicated_dismissed_concerns.is_empty() {
@@ -498,6 +511,7 @@ impl Worker {
             "fixes": state.fixes,
             "concerns_count": concerns_count,
             "dismissed_concerns_count": dismissed_concerns_count,
+            "review_map": review_map,
         });
 
         Ok(WorkerResult {
@@ -1478,10 +1492,10 @@ mod tests {
             } else if last_user.contains("# Verification and severity estimation")
                 || last_user.contains("# Consolidate, classify, and verify concerns")
             {
-                r#"{"findings": [], "hard_cases": [{"type": "Bug", "description": "some issue", "estimated_severity": "High", "signal_reason": "series_interaction", "concern_arguments": "reason", "dismissal_arguments": "", "verification_question": "check series end", "preexisting": false, "locations": []}], "dismissed_concerns": []}"#
+                r#"{"findings": [], "hard_cases": [{"source_ids": ["C1"], "type": "Bug", "description": "some issue", "estimated_severity": "High", "signal_reason": "series_interaction", "concern_arguments": "reason", "dismissal_arguments": "", "verification_question": "check series end", "preexisting": false, "locations": []}], "dismissed_concerns": []}"#
             } else if last_user.contains("# Per-finding post-verification and conflict resolution")
             {
-                r#"{"findings": [], "dismissed_concerns": [{"description": "some issue", "reasoning": "fixed in patch 2", "locations": [{"file": "file2.c", "function_or_symbol": "patch2", "line": 1, "code_snippet": "int patch2;"}]}]}"#
+                r#"{"findings": [], "dismissed_concerns": [{"source_ids": ["H1"], "description": "some issue", "reasoning": "fixed in patch 2", "locations": [{"file": "file2.c", "function_or_symbol": "patch2", "line": 1, "code_snippet": "int patch2;"}]}]}"#
             } else {
                 r#"{"concerns": [], "dismissed_concerns": []}"#
             };
@@ -1666,7 +1680,7 @@ mod tests {
                 } else if last_user.contains("# Verification and severity estimation")
                     || last_user.contains("# Consolidate, classify, and verify concerns")
                 {
-                    r#"{"findings": [{"problem": "some issue", "severity": "High", "severity_explanation": "bad", "preexisting": false, "locations": []}], "hard_cases": [], "dismissed_concerns": []}"#
+                    r#"{"findings": [{"source_ids": ["C1"], "problem": "some issue", "severity": "High", "severity_explanation": "bad", "preexisting": false, "locations": []}], "hard_cases": [], "dismissed_concerns": []}"#
                 } else {
                     r#"{"concerns": [], "dismissed_concerns": []}"#
                 };
@@ -1723,6 +1737,14 @@ mod tests {
                 .expect("worker should succeed");
             let output = res.output.expect("worker output");
             assert_eq!(output["findings"].as_array().unwrap().len(), 1);
+            assert!(
+                output["findings"][0]["finding_id"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with(&format!("{}-", project.as_str()))
+            );
+            assert_eq!(output["review_map"]["project"], project.as_str());
+            assert_eq!(output["review_map"]["threads"].as_array().unwrap().len(), 1);
             assert_eq!(output["review_inline"], "");
             assert_eq!(output["summary"], "");
         }
@@ -1751,7 +1773,7 @@ mod tests {
                 } else if last_user.contains("# Verification and severity estimation")
                     || last_user.contains("# Consolidate, classify, and verify concerns")
                 {
-                    r#"{"findings": [{"problem": "mm: memory leak in foo()", "severity": "High", "severity_explanation": "foo() returns -ENOMEM without freeing buf", "preexisting": true, "locations": [{"file": "foo.c", "function_or_symbol": "foo", "line": 10, "code_snippet": "return -ENOMEM;", "why_this_location_matters": "leaks buf"}]}], "hard_cases": [], "dismissed_concerns": []}"#
+                    r#"{"findings": [{"source_ids": ["C1"], "problem": "mm: memory leak in foo()", "severity": "High", "severity_explanation": "foo() returns -ENOMEM without freeing buf", "preexisting": true, "locations": [{"file": "foo.c", "function_or_symbol": "foo", "line": 10, "code_snippet": "return -ENOMEM;", "why_this_location_matters": "leaks buf"}]}], "hard_cases": [], "dismissed_concerns": []}"#
                 } else if last_user.contains("# LKML-friendly report generation") {
                     "commit sha1\nAuthor: Test <test@example.com>\n\nSubject\n\nSummary.\n\n> +int x;\n\n[Severity: High]\nThis problem wasn't introduced by this patch, but foo() leaks buf on error.\n"
                 } else {
