@@ -31,6 +31,23 @@ pub struct SessionResult<T> {
     pub usage: AiUsage,
 }
 
+/// Error returned when an [`LlmSession`] fails, preserving partial conversation
+/// history and token usage accumulated before the failure.
+#[derive(Debug, Clone)]
+pub struct SessionFailure {
+    pub message: String,
+    pub history: Vec<AiMessage>,
+    pub usage: AiUsage,
+}
+
+impl std::fmt::Display for SessionFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.message)
+    }
+}
+
+impl std::error::Error for SessionFailure {}
+
 /// Result of validating a session's final response.
 #[derive(Debug)]
 pub enum ValidationError {
@@ -215,21 +232,45 @@ impl<'a> SessionRunner<'a> {
             tool_call_id: None,
         }];
 
-        let mut turns = 0;
+        let mut turns: usize = 0;
         let mut validation_attempts = 0;
         // Requests whose answers were rejected, forgotten only if the stage
         // gives up.
         let mut rejected: Vec<AiRequest> = Vec::new();
-        let mut transient_retries = 0;
+        let mut transient_retries: usize = 0;
         let mut provider_error_retries = 0;
         let mut total_prompt_tokens = 0;
         let mut total_completion_tokens = 0;
         let mut total_cached_tokens = 0;
 
+        let make_failure = |message: String,
+                            history: Vec<AiMessage>,
+                            prompt_tokens: usize,
+                            completion_tokens: usize,
+                            cached_tokens: usize|
+         -> anyhow::Error {
+            anyhow::Error::new(SessionFailure {
+                message,
+                history,
+                usage: AiUsage {
+                    prompt_tokens,
+                    completion_tokens,
+                    total_tokens: prompt_tokens.saturating_add(completion_tokens),
+                    cached_tokens: Some(cached_tokens),
+                },
+            })
+        };
+
         loop {
-            turns += 1;
+            turns = turns.saturating_add(1);
             if turns > self.max_turns {
-                anyhow::bail!("Session exceeded max turns limit ({})", self.max_turns);
+                return Err(make_failure(
+                    format!("Session exceeded max turns limit ({})", self.max_turns),
+                    log_history,
+                    total_prompt_tokens,
+                    total_completion_tokens,
+                    total_cached_tokens,
+                ));
             }
             if let Some(ref cb) = self.on_turn {
                 cb(turns, self.max_turns);
@@ -270,13 +311,18 @@ impl<'a> SessionRunner<'a> {
                 Err(e) => match classify_ai_error(&e) {
                     AiErrorClass::RateLimit { retry_after }
                     | AiErrorClass::Transient { retry_after } => {
-                        transient_retries += 1;
+                        transient_retries = transient_retries.saturating_add(1);
                         if transient_retries > self.max_transient_retries {
-                            anyhow::bail!(
-                                "Session failed after {} transient/rate-limit errors. Last error: {}",
-                                self.max_transient_retries,
-                                e
-                            );
+                            return Err(make_failure(
+                                format!(
+                                    "Session failed after {} transient/rate-limit errors. Last error: {}",
+                                    self.max_transient_retries, e
+                                ),
+                                log_history,
+                                total_prompt_tokens,
+                                total_completion_tokens,
+                                total_cached_tokens,
+                            ));
                         }
                         tracing::warn!(
                             "API error ({}), pausing for {:?} before retry (attempt {}/{})...",
@@ -292,13 +338,18 @@ impl<'a> SessionRunner<'a> {
                     AiErrorClass::Fatal => {
                         match session.handle_provider_error(&e, provider_error_retries) {
                             ErrorAction::RetryWithFeedback(feedback) => {
-                                provider_error_retries += 1;
+                                provider_error_retries = provider_error_retries.saturating_add(1);
                                 if provider_error_retries > self.max_provider_error_retries {
-                                    anyhow::bail!(
-                                        "Session failed after {} provider error retries. Last error: {}",
-                                        self.max_provider_error_retries,
-                                        e
-                                    );
+                                    return Err(make_failure(
+                                        format!(
+                                            "Session failed after {} provider error retries. Last error: {}",
+                                            self.max_provider_error_retries, e
+                                        ),
+                                        log_history,
+                                        total_prompt_tokens,
+                                        total_completion_tokens,
+                                        total_cached_tokens,
+                                    ));
                                 }
                                 let msg = AiMessage {
                                     role: AiRole::User,
@@ -313,7 +364,20 @@ impl<'a> SessionRunner<'a> {
                                 turns = turns.saturating_sub(1);
                                 continue;
                             }
-                            ErrorAction::Fail => return Err(e),
+                            ErrorAction::Fail => {
+                                let message = e.to_string();
+                                return Err(e.context(SessionFailure {
+                                    message,
+                                    history: log_history,
+                                    usage: AiUsage {
+                                        prompt_tokens: total_prompt_tokens,
+                                        completion_tokens: total_completion_tokens,
+                                        total_tokens: total_prompt_tokens
+                                            .saturating_add(total_completion_tokens),
+                                        cached_tokens: Some(total_cached_tokens),
+                                    },
+                                }));
+                            }
                         }
                     }
                 },
@@ -326,13 +390,21 @@ impl<'a> SessionRunner<'a> {
                 for request in rejected.iter().chain(std::iter::once(&sent)) {
                     self.provider.forget(request).await;
                 }
-                anyhow::bail!("LLM output was truncated by provider (e.g. hit max tokens)");
+                return Err(make_failure(
+                    "LLM output was truncated by provider (e.g. hit max tokens)".to_string(),
+                    log_history,
+                    total_prompt_tokens,
+                    total_completion_tokens,
+                    total_cached_tokens,
+                ));
             }
 
             if let Some(usage) = &resp.usage {
-                total_prompt_tokens += usage.prompt_tokens;
-                total_completion_tokens += usage.completion_tokens;
-                total_cached_tokens += usage.cached_tokens.unwrap_or(0);
+                total_prompt_tokens = total_prompt_tokens.saturating_add(usage.prompt_tokens);
+                total_completion_tokens =
+                    total_completion_tokens.saturating_add(usage.completion_tokens);
+                total_cached_tokens =
+                    total_cached_tokens.saturating_add(usage.cached_tokens.unwrap_or(0));
             }
 
             let assistant_msg = AiMessage {
@@ -355,7 +427,23 @@ impl<'a> SessionRunner<'a> {
                         "Model emitted tool calls on final turn; ignoring tools to force validation."
                     );
                 } else {
-                    let results = session.call_tools(tool_calls.clone()).await?;
+                    let results = match session.call_tools(tool_calls.clone()).await {
+                        Ok(r) => r,
+                        Err(e) => {
+                            let message = e.to_string();
+                            return Err(e.context(SessionFailure {
+                                message,
+                                history: log_history,
+                                usage: AiUsage {
+                                    prompt_tokens: total_prompt_tokens,
+                                    completion_tokens: total_completion_tokens,
+                                    total_tokens: total_prompt_tokens
+                                        .saturating_add(total_completion_tokens),
+                                    cached_tokens: Some(total_cached_tokens),
+                                },
+                            }));
+                        }
+                    };
                     for (call_id, result) in results {
                         let tool_msg = AiMessage {
                             role: AiRole::Tool,
@@ -378,7 +466,7 @@ impl<'a> SessionRunner<'a> {
                     let usage = AiUsage {
                         prompt_tokens: total_prompt_tokens,
                         completion_tokens: total_completion_tokens,
-                        total_tokens: total_prompt_tokens + total_completion_tokens,
+                        total_tokens: total_prompt_tokens.saturating_add(total_completion_tokens),
                         cached_tokens: Some(total_cached_tokens),
                     };
                     return Ok(SessionResult {
@@ -396,11 +484,16 @@ impl<'a> SessionRunner<'a> {
                         for request in &rejected {
                             self.provider.forget(request).await;
                         }
-                        anyhow::bail!(
-                            "Failed to generate valid response after {} validation attempts. Last violation: {}",
-                            self.max_validation_attempts,
-                            violation
-                        );
+                        return Err(make_failure(
+                            format!(
+                                "Failed to generate valid response after {} validation attempts. Last violation: {}",
+                                self.max_validation_attempts, violation
+                            ),
+                            log_history,
+                            total_prompt_tokens,
+                            total_completion_tokens,
+                            total_cached_tokens,
+                        ));
                     }
                     let feedback = session.format_validation_feedback(&violation);
                     let msg = AiMessage {
@@ -416,7 +509,13 @@ impl<'a> SessionRunner<'a> {
                     turns = turns.saturating_sub(1);
                 }
                 Result::Err(ValidationError::Fatal(err)) => {
-                    anyhow::bail!("Fatal validation error: {}", err);
+                    return Err(make_failure(
+                        format!("Fatal validation error: {}", err),
+                        log_history,
+                        total_prompt_tokens,
+                        total_completion_tokens,
+                        total_cached_tokens,
+                    ));
                 }
             }
         }
