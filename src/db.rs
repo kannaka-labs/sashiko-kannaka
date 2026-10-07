@@ -8211,7 +8211,12 @@ impl Database {
                 "SELECT r.id, r.model, r.summary, r.created_at, ai.input_context, ai.output_raw, 
                         b.repo_url, b.branch, b.last_known_commit,
                         r.provider, r.prompts_hash, r.result_description,
-                        r.status, r.inline_review, r.logs, ai.tokens_in, ai.tokens_out, r.patch_id, ai.tokens_cached
+                        r.status, r.inline_review, r.logs, ai.tokens_in, ai.tokens_out, r.patch_id, ai.tokens_cached,
+                        r.patchset_id,
+                        COALESCE(
+                            (SELECT m.subject FROM patches p JOIN messages m ON p.message_id = m.message_id WHERE p.id = r.patch_id LIMIT 1),
+                            (SELECT ps.subject FROM patchsets ps WHERE ps.id = r.patchset_id)
+                        )
              FROM reviews r
              LEFT JOIN ai_interactions ai ON r.interaction_id = ai.id
              LEFT JOIN baselines b ON r.baseline_id = b.id
@@ -8249,6 +8254,8 @@ impl Database {
                 "tokens_out": r.get::<Option<u32>>(16).ok(),
                 "patch_id": r.get::<Option<i64>>(17).ok(),
                 "tokens_cached": r.get::<Option<u32>>(18).ok(),
+                "patchset_id": r.get::<Option<i64>>(19).ok(),
+                "subject": r.get::<Option<String>>(20).ok(),
                 "bugs": bugs_json,
             })))
         } else {
