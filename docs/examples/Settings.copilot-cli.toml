@@ -3,3 +3,6 @@ provider = "copilot-cli"
 model = "claude-sonnet-4.5"
 max_input_tokens = 40000
 max_interactions = 150
+
+[review]
+concurrency = 4
