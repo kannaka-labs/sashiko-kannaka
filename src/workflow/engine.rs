@@ -22,7 +22,21 @@ use crate::ai::AiMessage;
 use super::events::WorkflowEvent;
 use super::graph::{Workflow, WorkflowStep};
 use super::policy::ParallelPolicy;
-use super::stage::{ExecutableStage, WorkflowEnv};
+use super::stage::{ExecutableStage, StageOutcome, WorkflowEnv};
+
+/// Execution telemetry and transcript slice bounds for a single stage.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct StageRunRecord {
+    pub name: String,
+    pub skipped: bool,
+    pub turns: usize,
+    pub tokens_in: u32,
+    pub tokens_out: u32,
+    pub tokens_cached: u32,
+    pub prompts_read: Vec<String>,
+    pub history_start: usize,
+    pub history_end: usize,
+}
 
 /// Execution outcome and aggregated metrics from running a workflow.
 #[derive(Debug, Clone, Default)]
@@ -31,8 +45,88 @@ pub struct WorkflowOutcome {
     pub tokens_out: u32,
     pub tokens_cached: u32,
     pub history: Vec<AiMessage>,
+    pub stage_runs: Vec<StageRunRecord>,
     pub early_exit: bool,
     pub early_exit_reason: Option<&'static str>,
+}
+
+/// Error wrapper attached by [`WorkflowEngine::execute`] when a workflow aborts,
+/// preserving the partial [`WorkflowOutcome`] accumulated across all completed
+/// and failed stages up to the point of failure.
+#[derive(Debug, Clone)]
+pub struct WorkflowFailure {
+    pub message: String,
+    pub outcome: WorkflowOutcome,
+}
+
+impl std::fmt::Display for WorkflowFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for WorkflowFailure {}
+
+fn stage_outcome_from_error(err: &anyhow::Error) -> StageOutcome {
+    if let Some(failure) = err.downcast_ref::<crate::ai::SessionFailure>() {
+        StageOutcome {
+            tokens_in: u32::try_from(failure.usage.prompt_tokens).unwrap_or(u32::MAX),
+            tokens_out: u32::try_from(failure.usage.completion_tokens).unwrap_or(u32::MAX),
+            tokens_cached: u32::try_from(failure.usage.cached_tokens.unwrap_or(0))
+                .unwrap_or(u32::MAX),
+            history: failure.history.clone(),
+            skipped: false,
+        }
+    } else {
+        StageOutcome {
+            skipped: false,
+            ..Default::default()
+        }
+    }
+}
+
+fn record_stage_outcome(
+    outcome: &mut WorkflowOutcome,
+    stage_name: &str,
+    stage_outcome: StageOutcome,
+) {
+    let history_start = outcome.history.len();
+    let skipped = stage_outcome.skipped();
+    let turns = stage_outcome.turns();
+    let prompts_read = stage_outcome.read_prompts();
+    outcome.tokens_in = outcome.tokens_in.saturating_add(stage_outcome.tokens_in);
+    outcome.tokens_out = outcome.tokens_out.saturating_add(stage_outcome.tokens_out);
+    outcome.tokens_cached = outcome
+        .tokens_cached
+        .saturating_add(stage_outcome.tokens_cached);
+    outcome.history.extend(stage_outcome.history);
+    let history_end = outcome.history.len();
+    outcome.stage_runs.push(StageRunRecord {
+        name: stage_name.to_string(),
+        skipped,
+        turns,
+        tokens_in: stage_outcome.tokens_in,
+        tokens_out: stage_outcome.tokens_out,
+        tokens_cached: stage_outcome.tokens_cached,
+        prompts_read,
+        history_start,
+        history_end,
+    });
+}
+
+fn merge_workflow_outcome(outcome: &mut WorkflowOutcome, branch_outcome: WorkflowOutcome) {
+    let base_history_len = outcome.history.len();
+    outcome.tokens_in = outcome.tokens_in.saturating_add(branch_outcome.tokens_in);
+    outcome.tokens_out = outcome.tokens_out.saturating_add(branch_outcome.tokens_out);
+    outcome.tokens_cached = outcome
+        .tokens_cached
+        .saturating_add(branch_outcome.tokens_cached);
+    outcome.history.extend(branch_outcome.history);
+    for mut rec in branch_outcome.stage_runs {
+        rec.history_start = rec.history_start.saturating_add(base_history_len);
+        rec.history_end = rec.history_end.saturating_add(base_history_len);
+        outcome.stage_runs.push(rec);
+    }
 }
 
 /// The runtime engine that drives workflow execution.
@@ -53,20 +147,40 @@ impl WorkflowEngine {
         }
 
         let mut outcome = WorkflowOutcome::default();
+        if let Err(err) = Self::execute_steps(workflow, env, state, event_cb, &mut outcome).await {
+            let message = err.to_string();
+            return Err(err.context(WorkflowFailure { message, outcome }));
+        }
 
+        if let Some(cb) = event_cb {
+            cb(WorkflowEvent::WorkflowFinished {
+                name: workflow.name,
+                total_tokens: outcome.tokens_in.saturating_add(outcome.tokens_out),
+            });
+        }
+
+        Ok(outcome)
+    }
+
+    async fn execute_steps<S: Send + Sync + 'static>(
+        workflow: &Workflow<S>,
+        env: &WorkflowEnv<'_>,
+        state: &mut S,
+        event_cb: Option<&(dyn Fn(WorkflowEvent) + Send + Sync)>,
+        outcome: &mut WorkflowOutcome,
+    ) -> Result<()> {
         for step in &workflow.steps {
             match step {
-                WorkflowStep::Stage(stage) => {
-                    let stage_outcome = stage.execute(env, state, event_cb).await?;
-                    outcome.tokens_in += stage_outcome.tokens_in;
-                    outcome.tokens_out += stage_outcome.tokens_out;
-                    outcome.tokens_cached += stage_outcome.tokens_cached;
-                    outcome.history.extend(stage_outcome.history);
-                }
+                WorkflowStep::Stage(stage) => match stage.execute(env, state, event_cb).await {
+                    Ok(stage_outcome) => record_stage_outcome(outcome, stage.name(), stage_outcome),
+                    Err(err) => {
+                        record_stage_outcome(outcome, stage.name(), stage_outcome_from_error(&err));
+                        return Err(err);
+                    }
+                },
 
                 WorkflowStep::Parallel { stages, policy } => {
-                    execute_parallel_batch(stages, *policy, env, state, event_cb, &mut outcome)
-                        .await?;
+                    execute_parallel_batch(stages, *policy, env, state, event_cb, outcome).await?;
                 }
 
                 WorkflowStep::DynamicParallel {
@@ -74,11 +188,18 @@ impl WorkflowEngine {
                     resolver,
                     policy,
                 } => {
-                    let planner_outcome = planner.execute(env, state, event_cb).await?;
-                    outcome.tokens_in += planner_outcome.tokens_in;
-                    outcome.tokens_out += planner_outcome.tokens_out;
-                    outcome.tokens_cached += planner_outcome.tokens_cached;
-                    outcome.history.extend(planner_outcome.history);
+                    let planner_outcome = match planner.execute(env, state, event_cb).await {
+                        Ok(out) => out,
+                        Err(err) => {
+                            record_stage_outcome(
+                                outcome,
+                                planner.name(),
+                                stage_outcome_from_error(&err),
+                            );
+                            return Err(err);
+                        }
+                    };
+                    record_stage_outcome(outcome, planner.name(), planner_outcome);
 
                     let dynamic_stages = resolver(state);
                     if let Some(cb) = event_cb {
@@ -93,7 +214,7 @@ impl WorkflowEngine {
                             env,
                             state,
                             event_cb,
-                            &mut outcome,
+                            outcome,
                         )
                         .await?;
                     }
@@ -104,23 +225,33 @@ impl WorkflowEngine {
                     then_flow,
                     else_flow,
                 } => {
-                    let branch_outcome = if condition(state) {
-                        Box::pin(Self::execute(then_flow, env, state, event_cb)).await?
+                    let branch_res = if condition(state) {
+                        Some(Box::pin(Self::execute(then_flow, env, state, event_cb)).await)
                     } else if let Some(else_flow) = else_flow {
-                        Box::pin(Self::execute(else_flow, env, state, event_cb)).await?
+                        Some(Box::pin(Self::execute(else_flow, env, state, event_cb)).await)
                     } else {
-                        WorkflowOutcome::default()
+                        None
                     };
 
-                    outcome.tokens_in += branch_outcome.tokens_in;
-                    outcome.tokens_out += branch_outcome.tokens_out;
-                    outcome.tokens_cached += branch_outcome.tokens_cached;
-                    outcome.history.extend(branch_outcome.history);
-
-                    if branch_outcome.early_exit {
-                        outcome.early_exit = true;
-                        outcome.early_exit_reason = branch_outcome.early_exit_reason;
-                        break;
+                    if let Some(res) = branch_res {
+                        match res {
+                            Ok(branch_outcome) => {
+                                let early_exit = branch_outcome.early_exit;
+                                let early_exit_reason = branch_outcome.early_exit_reason;
+                                merge_workflow_outcome(outcome, branch_outcome);
+                                if early_exit {
+                                    outcome.early_exit = true;
+                                    outcome.early_exit_reason = early_exit_reason;
+                                    break;
+                                }
+                            }
+                            Err(err) => {
+                                if let Some(wf) = err.downcast_ref::<WorkflowFailure>() {
+                                    merge_workflow_outcome(outcome, wf.outcome.clone());
+                                }
+                                return Err(err);
+                            }
+                        }
                     }
                 }
 
@@ -137,15 +268,7 @@ impl WorkflowEngine {
                 }
             }
         }
-
-        if let Some(cb) = event_cb {
-            cb(WorkflowEvent::WorkflowFinished {
-                name: workflow.name,
-                total_tokens: outcome.tokens_in + outcome.tokens_out,
-            });
-        }
-
-        Ok(outcome)
+        Ok(())
     }
 }
 
@@ -161,17 +284,46 @@ async fn execute_parallel_batch<S: Send + Sync + 'static>(
 
     match policy {
         ParallelPolicy::FailFast => {
-            let futures = stages
-                .iter()
-                .map(|stage| stage.execute_isolated(env, state, event_cb));
-            let results = futures::future::try_join_all(futures).await?;
-
-            for (stage_outcome, mutation) in results {
-                mutation(state);
-                outcome.tokens_in += stage_outcome.tokens_in;
-                outcome.tokens_out += stage_outcome.tokens_out;
-                outcome.tokens_cached += stage_outcome.tokens_cached;
-                outcome.history.extend(stage_outcome.history);
+            let state_ref: &S = state;
+            let completed_outcomes: Vec<std::sync::Mutex<Option<StageOutcome>>> = (0..stages.len())
+                .map(|_| std::sync::Mutex::new(None))
+                .collect();
+            let outcomes_ref = &completed_outcomes;
+            let futures = stages.iter().enumerate().map(|(idx, stage)| async move {
+                match stage.execute_isolated(env, state_ref, event_cb).await {
+                    Ok((stage_outcome, mutation)) => {
+                        if let Ok(mut slot) = outcomes_ref[idx].lock() {
+                            *slot = Some(stage_outcome);
+                        }
+                        Ok(mutation)
+                    }
+                    Err(err) => {
+                        if let Ok(mut slot) = outcomes_ref[idx].lock() {
+                            *slot = Some(stage_outcome_from_error(&err));
+                        }
+                        Err(err)
+                    }
+                }
+            });
+            match futures::future::try_join_all(futures).await {
+                Ok(mutations) => {
+                    for ((stage, slot), mutation) in
+                        stages.iter().zip(completed_outcomes).zip(mutations)
+                    {
+                        mutation(state);
+                        if let Ok(Some(stage_outcome)) = slot.into_inner() {
+                            record_stage_outcome(outcome, stage.name(), stage_outcome);
+                        }
+                    }
+                }
+                Err(err) => {
+                    for (stage, slot) in stages.iter().zip(completed_outcomes) {
+                        if let Ok(Some(stage_outcome)) = slot.into_inner() {
+                            record_stage_outcome(outcome, stage.name(), stage_outcome);
+                        }
+                    }
+                    return Err(err);
+                }
             }
         }
 
@@ -181,18 +333,15 @@ async fn execute_parallel_batch<S: Send + Sync + 'static>(
                 .map(|stage| stage.execute_isolated(env, state, event_cb));
             let results = futures::future::join_all(futures).await;
 
-            let mut successes = 0;
+            let mut successes = 0usize;
             let mut first_error = None;
 
             for (stage, res) in stages.iter().zip(results) {
                 match res {
                     Ok((stage_outcome, mutation)) => {
-                        successes += 1;
+                        successes = successes.saturating_add(1);
                         mutation(state);
-                        outcome.tokens_in += stage_outcome.tokens_in;
-                        outcome.tokens_out += stage_outcome.tokens_out;
-                        outcome.tokens_cached += stage_outcome.tokens_cached;
-                        outcome.history.extend(stage_outcome.history);
+                        record_stage_outcome(outcome, stage.name(), stage_outcome);
                     }
                     Err(err) => {
                         warn!(
@@ -200,6 +349,7 @@ async fn execute_parallel_batch<S: Send + Sync + 'static>(
                             stage.name(),
                             err
                         );
+                        record_stage_outcome(outcome, stage.name(), stage_outcome_from_error(&err));
                         if first_error.is_none() {
                             first_error = Some(err.context(format!(
                                 "All {} parallel stages failed under BestEffort policy (first failure in stage '{}')",
@@ -295,7 +445,12 @@ mod tests {
                 thought: None,
                 thought_signature: None,
                 tool_calls: None,
-                usage: None,
+                usage: Some(crate::ai::AiUsage {
+                    prompt_tokens: 10,
+                    completion_tokens: 5,
+                    total_tokens: 15,
+                    cached_tokens: None,
+                }),
                 truncated: false,
             })
         }
@@ -470,6 +625,15 @@ mod tests {
             .expect("BestEffort should succeed when at least one stage succeeds");
         assert!(!outcome.early_exit);
         assert_eq!(state.concerns, vec!["concern_ok".to_string()]);
+        assert_eq!(outcome.stage_runs.len(), 2);
+        assert_eq!(outcome.stage_runs[0].name, "stage_fail");
+        assert!(!outcome.stage_runs[0].skipped);
+        assert_eq!(outcome.stage_runs[0].history_start, 0);
+        assert_eq!(outcome.stage_runs[0].history_end, 1);
+        assert_eq!(outcome.stage_runs[1].name, "stage_ok");
+        assert!(!outcome.stage_runs[1].skipped);
+        assert_eq!(outcome.stage_runs[1].history_start, 1);
+        assert_eq!(outcome.stage_runs[1].history_end, 3);
     }
 
     #[tokio::test]
@@ -516,5 +680,191 @@ mod tests {
             res.is_err(),
             "BestEffort should fail when all parallel stages fail"
         );
+    }
+
+    #[tokio::test]
+    async fn test_workflow_stage_runs_telemetry_and_history_bounds() {
+        let provider = Arc::new(MockProvider::queued(vec![
+            r#"{"items": ["c1"]}"#.to_string(),
+            r#"{"items": ["c2"]}"#.to_string(),
+        ]));
+        let tmp = tempfile::tempdir().unwrap();
+        let tools = Arc::new(ToolBox::new(tmp.path().to_path_buf(), None));
+        let env = WorkflowEnv {
+            provider,
+            tools,
+            base_dir: tmp.path(),
+            context_tag: None,
+        };
+
+        let mut state = DummyState::default();
+        let workflow = Workflow::builder("telemetry_flow")
+            .stage(
+                Stage::builder("stage_run_1")
+                    .user_prompt(PromptTemplate::new("First"))
+                    .output_format(OutputFormat::json())
+                    .reduce(|s: &mut DummyState, out: DummyConcernsOutput| {
+                        s.concerns.extend(out.items);
+                    })
+                    .build(),
+            )
+            .stage(
+                Stage::builder("stage_skipped")
+                    .user_prompt(PromptTemplate::new("Skipped"))
+                    .output_format(OutputFormat::json())
+                    .skip_if(|_: &DummyState| true)
+                    .reduce(|s: &mut DummyState, out: DummyConcernsOutput| {
+                        s.concerns.extend(out.items);
+                    })
+                    .build(),
+            )
+            .stage(
+                Stage::builder("stage_run_2")
+                    .user_prompt(PromptTemplate::new("Second"))
+                    .output_format(OutputFormat::json())
+                    .reduce(|s: &mut DummyState, out: DummyConcernsOutput| {
+                        s.findings.extend(out.items);
+                    })
+                    .build(),
+            )
+            .build();
+
+        let outcome = WorkflowEngine::execute(&workflow, &env, &mut state, None)
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.stage_runs.len(), 3);
+        assert_eq!(outcome.stage_runs[0].name, "stage_run_1");
+        assert!(!outcome.stage_runs[0].skipped);
+        assert_eq!(outcome.stage_runs[0].turns, 1);
+        assert_eq!(outcome.stage_runs[0].history_start, 0);
+        assert_eq!(outcome.stage_runs[0].history_end, 2);
+
+        assert_eq!(outcome.stage_runs[1].name, "stage_skipped");
+        assert!(outcome.stage_runs[1].skipped);
+        assert_eq!(outcome.stage_runs[1].turns, 0);
+        assert_eq!(outcome.stage_runs[1].history_start, 2);
+        assert_eq!(outcome.stage_runs[1].history_end, 2);
+
+        assert_eq!(outcome.stage_runs[2].name, "stage_run_2");
+        assert!(!outcome.stage_runs[2].skipped);
+        assert_eq!(outcome.stage_runs[2].turns, 1);
+        assert_eq!(outcome.stage_runs[2].history_start, 2);
+        assert_eq!(outcome.stage_runs[2].history_end, 4);
+        assert_eq!(outcome.history.len(), 4);
+    }
+
+    #[tokio::test]
+    async fn test_workflow_failure_preserves_accumulated_outcome_on_sequential_error() {
+        let provider = Arc::new(MockProvider::queued(vec![
+            r#"{"items": ["c1"]}"#.to_string(),
+            "not valid json".to_string(),
+            "still not valid json".to_string(),
+            "still not valid json".to_string(),
+        ]));
+        let tmp = tempfile::tempdir().unwrap();
+        let tools = Arc::new(ToolBox::new(tmp.path().to_path_buf(), None));
+        let env = WorkflowEnv {
+            provider,
+            tools,
+            base_dir: tmp.path(),
+            context_tag: None,
+        };
+
+        let mut state = DummyState::default();
+        let workflow = Workflow::builder("failure_telemetry_flow")
+            .stage(
+                Stage::builder("stage_ok")
+                    .user_prompt(PromptTemplate::new("First"))
+                    .output_format(OutputFormat::json())
+                    .reduce(|s: &mut DummyState, out: DummyConcernsOutput| {
+                        s.concerns.extend(out.items);
+                    })
+                    .build(),
+            )
+            .stage(
+                Stage::builder("stage_fail")
+                    .user_prompt(PromptTemplate::new("Second"))
+                    .output_format(OutputFormat::json())
+                    .reduce(|s: &mut DummyState, out: DummyConcernsOutput| {
+                        s.findings.extend(out.items);
+                    })
+                    .build(),
+            )
+            .build();
+
+        let err = WorkflowEngine::execute(&workflow, &env, &mut state, None)
+            .await
+            .expect_err("second stage should fail");
+        let wf = err
+            .downcast_ref::<WorkflowFailure>()
+            .expect("WorkflowFailure should be attached to error");
+        assert_eq!(wf.outcome.stage_runs.len(), 2);
+        assert_eq!(wf.outcome.stage_runs[0].name, "stage_ok");
+        assert_eq!(wf.outcome.stage_runs[1].name, "stage_fail");
+        assert_eq!(wf.outcome.tokens_in, 40);
+        assert_eq!(wf.outcome.tokens_out, 20);
+        assert!(!wf.outcome.history.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_workflow_fail_fast_preserves_completed_and_failed_sibling_outcomes() {
+        let provider = Arc::new(MockProvider::queued(vec![
+            r#"{"items": ["c1"]}"#.to_string(),
+            "not valid json".to_string(),
+            "still not valid json".to_string(),
+            "still not valid json".to_string(),
+        ]));
+        let tmp = tempfile::tempdir().unwrap();
+        let tools = Arc::new(ToolBox::new(tmp.path().to_path_buf(), None));
+        let env = WorkflowEnv {
+            provider,
+            tools,
+            base_dir: tmp.path(),
+            context_tag: None,
+        };
+
+        let mut state = DummyState::default();
+        let workflow = Workflow::builder("fail_fast_parallel_telemetry")
+            .parallel(
+                vec![
+                    Box::new(
+                        Stage::builder("stage_ok")
+                            .user_prompt(PromptTemplate::new("First"))
+                            .output_format(OutputFormat::json())
+                            .reduce(|s: &mut DummyState, out: DummyConcernsOutput| {
+                                s.concerns.extend(out.items);
+                            })
+                            .build(),
+                    ),
+                    Box::new(
+                        Stage::builder("stage_fail")
+                            .user_prompt(PromptTemplate::new("Second"))
+                            .output_format(OutputFormat::json())
+                            .reduce(|s: &mut DummyState, out: DummyConcernsOutput| {
+                                s.findings.extend(out.items);
+                            })
+                            .build(),
+                    ),
+                ],
+                ParallelPolicy::FailFast,
+            )
+            .build();
+
+        let err = WorkflowEngine::execute(&workflow, &env, &mut state, None)
+            .await
+            .expect_err("FailFast parallel batch should fail when a stage fails");
+        assert!(
+            state.concerns.is_empty(),
+            "FailFast must not apply state mutations when any sibling stage fails"
+        );
+        let wf = err
+            .downcast_ref::<WorkflowFailure>()
+            .expect("WorkflowFailure should be attached to error");
+        assert_eq!(wf.outcome.stage_runs.len(), 2);
+        assert_eq!(wf.outcome.stage_runs[0].name, "stage_ok");
+        assert_eq!(wf.outcome.stage_runs[1].name, "stage_fail");
+        assert_eq!(wf.outcome.tokens_in, 40);
+        assert_eq!(wf.outcome.tokens_out, 20);
     }
 }

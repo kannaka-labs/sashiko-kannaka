@@ -38,9 +38,23 @@ pub struct StageOutcome {
     pub tokens_out: u32,
     pub tokens_cached: u32,
     pub history: Vec<AiMessage>,
+    pub skipped: bool,
 }
 
 impl StageOutcome {
+    /// Returns true if the stage was skipped via `skip_if` without invoking the model.
+    pub fn skipped(&self) -> bool {
+        self.skipped
+    }
+
+    /// Returns the number of assistant turns recorded in this stage's conversation history.
+    pub fn turns(&self) -> usize {
+        self.history
+            .iter()
+            .filter(|m| m.role == crate::ai::AiRole::Assistant)
+            .count()
+    }
+
     /// Extracts deduplicated prompt file names requested via `read_prompt` tool calls in this stage's history.
     pub fn read_prompts(&self) -> Vec<String> {
         let mut prompts = Vec::new();
@@ -493,6 +507,7 @@ impl<S: Send + Sync + 'static, T: DeserializeOwned + Send + 'static> ExecutableS
                     tokens_in: 0,
                     tokens_out: 0,
                     tokens_cached: 0,
+                    skipped: true,
                 },
                 Box::new(|_| {}),
             ));
@@ -546,9 +561,10 @@ impl<S: Send + Sync + 'static, T: DeserializeOwned + Send + 'static> ExecutableS
             runner.run(&mut session).await?
         };
 
-        let tokens_in = result.usage.prompt_tokens as u32;
-        let tokens_out = result.usage.completion_tokens as u32;
-        let tokens_cached = result.usage.cached_tokens.unwrap_or(0) as u32;
+        let tokens_in = u32::try_from(result.usage.prompt_tokens).unwrap_or(u32::MAX);
+        let tokens_out = u32::try_from(result.usage.completion_tokens).unwrap_or(u32::MAX);
+        let tokens_cached =
+            u32::try_from(result.usage.cached_tokens.unwrap_or(0)).unwrap_or(u32::MAX);
 
         if let Some(cb) = event_cb {
             cb(WorkflowEvent::StageFinished {
@@ -564,6 +580,7 @@ impl<S: Send + Sync + 'static, T: DeserializeOwned + Send + 'static> ExecutableS
             tokens_out,
             tokens_cached,
             history: result.history,
+            skipped: false,
         };
 
         let mutation: StateMutation<S> = if let Some(ref outcome_reducer) = self.outcome_reducer {
