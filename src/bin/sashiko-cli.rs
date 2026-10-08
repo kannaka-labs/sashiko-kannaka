@@ -260,15 +260,15 @@ enum BugCommands {
         #[arg(long, default_value_t = 20)]
         per_page: usize,
     },
-    /// Show full details of a bug by ID
+    /// Show full details of a bug by bugid or ID
     Show {
-        /// Bug ID
-        id: i64,
+        /// Bug identifier (<project>-<uuid> or numeric ID)
+        id: String,
     },
     /// Perform a triage action or add a comment on a bug
     Action {
-        /// Bug ID
-        id: i64,
+        /// Bug identifier (<project>-<uuid> or numeric ID)
+        id: String,
 
         /// Action to perform (comment, close, dismiss, assign, mark_duplicate)
         #[arg(long)]
@@ -282,9 +282,9 @@ enum BugCommands {
         #[arg(long)]
         assignee: Option<String>,
 
-        /// Canonical bug ID (for mark_duplicate action)
+        /// Canonical bug identifier (<project>-<uuid> or numeric ID, for mark_duplicate action)
         #[arg(long)]
-        duplicate_of: Option<i64>,
+        duplicate_of: Option<String>,
     },
 }
 
@@ -525,6 +525,15 @@ async fn run_command(
     }
 }
 
+fn bug_query_param(id: &str) -> (&'static str, String) {
+    let trimmed = id.trim();
+    if trimmed.parse::<i64>().is_ok() {
+        ("id", trimmed.to_string())
+    } else {
+        ("bugid", trimmed.to_string())
+    }
+}
+
 async fn handle_bugs(
     client: &Client,
     base_url: &str,
@@ -571,24 +580,33 @@ async fn handle_bugs(
                     let total = body["total"].as_u64().unwrap_or(bugs.len() as u64);
                     println!("Bugs ({} total):", total);
                     for bug in bugs {
-                        let id = bug["internal_id"]
-                            .as_i64()
-                            .or_else(|| bug["id"].as_i64())
-                            .unwrap_or_default();
+                        let label = bug["slug"]
+                            .as_str()
+                            .filter(|s| !s.is_empty())
+                            .or_else(|| bug["bugid"].as_str().filter(|s| !s.is_empty()))
+                            .map(str::to_string)
+                            .unwrap_or_else(|| {
+                                let id = bug["internal_id"]
+                                    .as_i64()
+                                    .or_else(|| bug["id"].as_i64())
+                                    .unwrap_or_default();
+                                id.to_string()
+                            });
                         let sev = bug["severity"].as_str().unwrap_or("unknown");
                         let st = bug["lifecycle_status"].as_str().unwrap_or("unknown");
                         let title = bug["title"].as_str().unwrap_or("(untitled)");
-                        println!("  #{:<6} [{:<8}] ({:<9}) {}", id, sev, st, title);
+                        println!("  {} [{:<8}] ({:<9}) {}", label, sev, st, title);
                     }
                 }
             }
             Ok(())
         }
         BugCommands::Show { id } => {
+            let query_param = bug_query_param(&id);
             let resp = check_response(
                 client
                     .get(format!("{}/api/bug", base_url))
-                    .query(&[("id", id.to_string())])
+                    .query(&[query_param])
                     .send()
                     .await?,
             )
@@ -599,14 +617,16 @@ async fn handle_bugs(
                     println!("{}", serde_json::to_string_pretty(&body)?);
                 }
                 OutputFormat::Text => {
-                    let bug_id = body["internal_id"]
-                        .as_i64()
-                        .or_else(|| body["id"].as_i64())
-                        .unwrap_or(id);
+                    let label = body["slug"]
+                        .as_str()
+                        .filter(|s| !s.is_empty())
+                        .or_else(|| body["bugid"].as_str().filter(|s| !s.is_empty()))
+                        .map(str::to_string)
+                        .unwrap_or_else(|| id.clone());
                     let title = body["title"].as_str().unwrap_or("(untitled)");
                     let sev = body["severity"].as_str().unwrap_or("unknown");
                     let st = body["lifecycle_status"].as_str().unwrap_or("unknown");
-                    println!("Bug #{}: {}", bug_id, title);
+                    println!("{}: {}", label, title);
                     println!("Severity: {} | Status: {}", sev, st);
                     if let Some(desc) = body["description"]
                         .as_str()
@@ -654,10 +674,20 @@ async fn handle_bugs(
                     if assignee.is_some() {
                         anyhow::bail!("Action 'mark_duplicate' does not accept --assignee");
                     }
-                    let dup = duplicate_of.ok_or_else(|| {
-                        anyhow::anyhow!("Action 'mark_duplicate' requires --duplicate-of <ID>")
-                    })?;
-                    map.insert("duplicate_of_id".to_string(), Value::from(dup));
+                    let dup = duplicate_of
+                        .filter(|s| !s.trim().is_empty())
+                        .ok_or_else(|| {
+                            anyhow::anyhow!("Action 'mark_duplicate' requires --duplicate-of <ID>")
+                        })?;
+                    let dup_trimmed = dup.trim();
+                    if let Ok(dup_id) = dup_trimmed.parse::<i64>() {
+                        map.insert("duplicate_of_id".to_string(), Value::from(dup_id));
+                    } else {
+                        map.insert(
+                            "duplicate_of_bugid".to_string(),
+                            Value::String(dup_trimmed.to_string()),
+                        );
+                    }
                     if let Some(c) = comment {
                         map.insert("reasoning".to_string(), Value::String(c));
                     }
@@ -688,10 +718,11 @@ async fn handle_bugs(
                     );
                 }
             }
+            let query_param = bug_query_param(&id);
             let resp = check_response(
                 client
                     .post(format!("{}/api/bug/action", base_url))
-                    .query(&[("id", id.to_string())])
+                    .query(&[query_param])
                     .json(&Value::Object(map))
                     .send()
                     .await?,
@@ -703,7 +734,7 @@ async fn handle_bugs(
                     println!("{}", serde_json::to_string_pretty(&body)?);
                 }
                 OutputFormat::Text => {
-                    println!("Bug #{} updated ({}).", id, action);
+                    println!("Bug {} updated ({}).", id, action);
                 }
             }
             Ok(())
@@ -2599,8 +2630,53 @@ mod tests {
         assert!(matches!(
             show.command,
             Commands::Bugs {
-                action: BugCommands::Show { id: 42 }
-            }
+                action: BugCommands::Show { ref id }
+            } if id == "42"
+        ));
+        assert_eq!(bug_query_param("42"), ("id", "42".to_string()));
+
+        let show_bugid = Cli::try_parse_from([
+            "sashiko-cli",
+            "bugs",
+            "show",
+            "linux-123e4567-e89b-12d3-a456-426614174000",
+        ])
+        .unwrap();
+        assert!(matches!(
+            show_bugid.command,
+            Commands::Bugs {
+                action: BugCommands::Show { ref id }
+            } if id == "linux-123e4567-e89b-12d3-a456-426614174000"
+        ));
+        assert_eq!(
+            bug_query_param("linux-123e4567-e89b-12d3-a456-426614174000"),
+            (
+                "bugid",
+                "linux-123e4567-e89b-12d3-a456-426614174000".to_string()
+            )
+        );
+
+        let action_bugid = Cli::try_parse_from([
+            "sashiko-cli",
+            "bugs",
+            "action",
+            "linux-123e4567-e89b-12d3-a456-426614174000",
+            "--action",
+            "mark_duplicate",
+            "--duplicate-of",
+            "linux-00000000-0000-0000-0000-000000000001",
+        ])
+        .unwrap();
+        assert!(matches!(
+            action_bugid.command,
+            Commands::Bugs {
+                action: BugCommands::Action {
+                    ref id,
+                    duplicate_of: Some(ref dup),
+                    ..
+                }
+            } if id == "linux-123e4567-e89b-12d3-a456-426614174000"
+                && dup == "linux-00000000-0000-0000-0000-000000000001"
         ));
 
         let token_cmd = Cli::try_parse_from([
