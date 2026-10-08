@@ -244,6 +244,15 @@ impl Principal {
     /// only those matches no maintainer and stays invisible to them, which is
     /// the intended outcome for a bug nobody could classify.
     pub fn access_to(&self, attributed: &[SectionTitle]) -> BugAccess {
+        self.access_to_with_bugid(attributed, false)
+    }
+
+    /// Resolves the access level for a bug from the subsystems attributed to
+    /// it and whether the caller addressed the bug by its `bugid`.
+    ///
+    /// Knowing the `bugid` grants `BugAccess::Read` on that single bug, subject
+    /// to any explicit `max_access` ceiling imposed on a scoped API token.
+    pub fn access_to_with_bugid(&self, attributed: &[SectionTitle], has_bugid: bool) -> BugAccess {
         let base = if self.operator
             || self.global_maintainer
             || attributed
@@ -253,6 +262,8 @@ impl Principal {
             BugAccess::Manage
         } else if self.security {
             BugAccess::Comment
+        } else if has_bugid {
+            BugAccess::Read
         } else {
             BugAccess::None
         };
@@ -818,6 +829,45 @@ F:	*/
         assert_eq!(
             tp_none.access_to_patchset(&btrfs(), Some("operator@example.org")),
             TranscriptAccess::Denied
+        );
+    }
+
+    #[test]
+    fn test_access_to_with_bugid_grants_read_and_preserves_higher_roles() {
+        let idx = index();
+        let acl_cfg = acl();
+        let net = [SectionTitle::new("NETWORKING [GENERAL]")];
+
+        // Anonymous and unknown callers gain Read when addressing by bugid,
+        // including on unattributed bugs.
+        for caller in [
+            Principal::anonymous(),
+            Principal::resolve("stranger@example.org", &acl_cfg, Some(&idx)),
+        ] {
+            assert_eq!(
+                caller.access_to_with_bugid(&btrfs(), false),
+                BugAccess::None
+            );
+            assert_eq!(caller.access_to_with_bugid(&btrfs(), true), BugAccess::Read);
+            assert_eq!(caller.access_to_with_bugid(&[], true), BugAccess::Read);
+        }
+
+        // Subsystem maintainer keeps Manage on own subsystem and gets Read on
+        // another subsystem when addressing by bugid.
+        let davem = Principal::resolve("davem@davemloft.net", &acl_cfg, Some(&idx));
+        assert_eq!(davem.access_to_with_bugid(&net, true), BugAccess::Manage);
+        assert_eq!(davem.access_to_with_bugid(&btrfs(), true), BugAccess::Read);
+
+        // Security list keeps Comment when addressing by bugid.
+        let sec = Principal::resolve("security@example.org", &acl_cfg, Some(&idx));
+        assert_eq!(sec.access_to_with_bugid(&btrfs(), true), BugAccess::Comment);
+
+        // Explicit None token ceiling attenuates even bugid read access.
+        let none_token = Principal::resolve("stranger@example.org", &acl_cfg, Some(&idx))
+            .with_max_access(Some(BugAccess::None));
+        assert_eq!(
+            none_token.access_to_with_bugid(&btrfs(), true),
+            BugAccess::None
         );
     }
 }
