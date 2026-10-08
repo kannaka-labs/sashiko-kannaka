@@ -58,6 +58,27 @@ pub struct BugQuery {
     pub slug: Option<String>,
 }
 
+impl BugQuery {
+    /// Returns the trimmed `bugid` or `slug` parameter when the lookup is not
+    /// keyed on a sequential numeric `id`.
+    pub fn effective_bugid(&self) -> Option<&str> {
+        if self.id.is_some() {
+            return None;
+        }
+        self.bugid
+            .as_deref()
+            .or(self.slug.as_deref())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+    }
+
+    /// Whether this query addresses a bug by its `bugid` / `slug` rather than
+    /// its sequential integer `id`.
+    pub fn by_bugid(&self) -> bool {
+        self.effective_bugid().is_some()
+    }
+}
+
 #[derive(Deserialize)]
 pub struct BugListQuery {
     pub page: Option<usize>,

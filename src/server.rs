@@ -959,6 +959,17 @@ async fn bug_access(
     principal: &Principal,
     bug_id: i64,
 ) -> Result<BugAccess, StatusCode> {
+    bug_access_for_query(state, principal, bug_id, false).await
+}
+
+/// Resolves what the caller may do to one bug, accounting for whether the
+/// request addressed the bug by its `bugid` / `slug`.
+async fn bug_access_for_query(
+    state: &AppState,
+    principal: &Principal,
+    bug_id: i64,
+    by_bugid: bool,
+) -> Result<BugAccess, StatusCode> {
     let sections = state
         .db
         .authorizing_sections_for_bug(bug_id)
@@ -968,7 +979,24 @@ async fn bug_access(
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
     let titles: Vec<SectionTitle> = sections.iter().map(|s| SectionTitle::new(s)).collect();
-    Ok(principal.access_to(&titles))
+    Ok(principal.access_to_with_bugid(&titles, by_bugid))
+}
+
+/// Resolves the caller's standing for a single-bug read route.
+///
+/// Addressing a bug by its `bugid` / `slug` is a capability read, so an
+/// unauthenticated caller (or one holding an expired session) resolves to the
+/// anonymous principal rather than being rejected with 401. Addressing a bug
+/// by its sequential numeric `id` requires a valid session or API token.
+fn resolve_bug_read_principal(
+    principal: Result<Principal, (StatusCode, &'static str)>,
+    query: &BugQuery,
+) -> Result<Principal, StatusCode> {
+    match principal {
+        Ok(p) => Ok(p),
+        Err(_) if query.by_bugid() => Ok(Principal::anonymous()),
+        Err((status, _)) => Err(status),
+    }
 }
 
 /// The subset of the given bugs the caller may read, resolved in one query.
@@ -998,7 +1026,23 @@ async fn readable_bug_ids(
         .collect())
 }
 
-/// Loads the bug the query names and confirms the caller may read it.
+async fn lookup_bug(state: &AppState, query: &BugQuery) -> Result<crate::db::Bug, StatusCode> {
+    if let Some(id) = query.id {
+        state.db.get_bug(id).await
+    } else if let Some(bugid) = query.effective_bugid() {
+        state.db.get_bug_by_bugid(bugid).await
+    } else {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    .map_err(|e| {
+        tracing::error!("Database error fetching bug: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?
+    .ok_or(StatusCode::NOT_FOUND)
+}
+
+/// Loads the bug the query names and confirms the caller holds subsystem or
+/// global authority to read it.
 ///
 /// A bug outside the caller's authority answers 404, byte for byte the same as
 /// a bug that does not exist, so the response does not disclose which of the
@@ -1008,23 +1052,82 @@ async fn readable_bug(
     principal: &Principal,
     query: &BugQuery,
 ) -> Result<crate::db::Bug, StatusCode> {
-    let bug = if let Some(id) = query.id {
-        state.db.get_bug(id).await
-    } else if let Some(bugid) = query.bugid.as_ref().or(query.slug.as_ref()) {
-        state.db.get_bug_by_bugid(bugid).await
-    } else {
-        return Err(StatusCode::BAD_REQUEST);
-    }
-    .map_err(|e| {
-        tracing::error!("Database error fetching bug: {}", e);
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?
-    .ok_or(StatusCode::NOT_FOUND)?;
-
+    let bug = lookup_bug(state, query).await?;
     if !bug_access(state, principal, bug.id).await?.can_read() {
         return Err(StatusCode::NOT_FOUND);
     }
     Ok(bug)
+}
+
+/// Loads the bug for `GET /api/bug`, granting capability read access when the
+/// caller addresses the bug by its `bugid` / `slug`.
+async fn readable_bug_for_view(
+    state: &AppState,
+    principal: &Principal,
+    query: &BugQuery,
+) -> Result<(crate::db::Bug, BugAccess), StatusCode> {
+    let bug = lookup_bug(state, query).await?;
+    let access = bug_access_for_query(state, principal, bug.id, query.by_bugid()).await?;
+    if !access.can_read() {
+        return Err(StatusCode::NOT_FOUND);
+    }
+    Ok((bug, access))
+}
+
+/// Returns all bug IDs referenced by the bug's current or historical duplicate
+/// relations (both `bug.duplicate_of_id` and any `old`/`new` targets recorded
+/// in `duplicate_of_id` audit enrichments).
+fn referenced_duplicate_ids(bug: &crate::db::Bug) -> Vec<i64> {
+    let mut ids = Vec::new();
+    if let Some(id) = bug.duplicate_of_id {
+        ids.push(id);
+    }
+    for enrichment in &bug.enrichments {
+        if enrichment.kind == "audit"
+            && let Some(data) = &enrichment.data_json
+            && data["field"].as_str() == Some("duplicate_of_id")
+        {
+            for key in ["old", "new"] {
+                if let Some(id) = data[key]
+                    .as_i64()
+                    .or_else(|| data[key].as_str().and_then(|s| s.parse::<i64>().ok()))
+                {
+                    ids.push(id);
+                }
+            }
+        }
+    }
+    ids.sort_unstable();
+    ids.dedup();
+    ids
+}
+
+/// Redacts `audit` (`duplicate_of_id`) and `deduplication` enrichments on a
+/// bug unless all current and historical duplicate target bugs are within the
+/// caller's read authority, preventing deduplication reasoning or audit fields
+/// from leaking an inaccessible counterpart's ID or problem statement.
+fn redact_inaccessible_duplicate_enrichments(
+    bug: &mut crate::db::Bug,
+    readable_targets: &std::collections::HashSet<i64>,
+) {
+    let refs = referenced_duplicate_ids(bug);
+    if refs.iter().all(|id| readable_targets.contains(id)) {
+        return;
+    }
+    for enrichment in &mut bug.enrichments {
+        if enrichment.kind == "audit"
+            && enrichment
+                .data_json
+                .as_ref()
+                .is_some_and(|d| d["field"].as_str() == Some("duplicate_of_id"))
+        {
+            enrichment.content = Some("Duplicate relationship updated".to_string());
+            enrichment.data_json = Some(serde_json::json!({ "field": "duplicate_of_id" }));
+        } else if enrichment.kind == "deduplication" {
+            enrichment.content = Some("Matched an existing bug".to_string());
+            enrichment.data_json = None;
+        }
+    }
 }
 
 /// Loads the bug for one of the raw transcript endpoints.
@@ -1066,7 +1169,7 @@ async fn redact_embedded_bugs(
     };
     if bugs.is_empty() {
         return Ok(());
-    }
+    };
     let ids: Vec<i64> = bugs.iter().filter_map(|b| b["id"].as_i64()).collect();
     let readable = readable_bug_ids(state, principal, &ids).await?;
     if let Some(array) = payload.get_mut("bugs").and_then(|b| b.as_array_mut()) {
@@ -1076,11 +1179,12 @@ async fn redact_embedded_bugs(
 }
 
 async fn get_bug(
-    principal: Principal,
+    principal: Result<Principal, (StatusCode, &'static str)>,
     State(state): State<Arc<AppState>>,
     Query(query): Query<BugQuery>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    let bug = readable_bug(&state, &principal, &query).await?;
+    let principal = resolve_bug_read_principal(principal, &query)?;
+    let (bug, access) = readable_bug_for_view(&state, &principal, &query).await?;
     let mut val = serde_json::to_value(&bug).unwrap_or(serde_json::json!({}));
     val["slug"] = serde_json::Value::String(bug.bugid.clone());
     val["problem"] = serde_json::Value::String(bug.problem().to_string());
@@ -1100,7 +1204,6 @@ async fn get_bug(
     val["tokens_cached"] = serde_json::Value::Number(bug.tokens_cached().into());
 
     attach_duplicate_relations(&state, &principal, &bug, &mut val).await?;
-    let access = bug_access(&state, &principal, bug.id).await?;
     val["can_comment"] = serde_json::Value::Bool(!state.read_only && access.can_comment());
     val["can_manage"] = serde_json::Value::Bool(!state.read_only && access.can_manage());
     let mut family = state
@@ -1108,14 +1211,35 @@ async fn get_bug(
         .bug_family(bug.id, false)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    let family_ids: Vec<i64> = family.iter().map(|member| member.id).collect();
-    let readable = readable_bug_ids(&state, &principal, &family_ids).await?;
-    family.retain(|member| readable.contains(&member.id));
-    val["evidence"] = state
+    let mut check_ids: Vec<i64> = family.iter().map(|member| member.id).collect();
+    for member in &family {
+        check_ids.extend(referenced_duplicate_ids(member));
+    }
+    check_ids.sort_unstable();
+    check_ids.dedup();
+    let readable_by_principal = readable_bug_ids(&state, &principal, &check_ids).await?;
+    let mut readable_family = readable_by_principal.clone();
+    readable_family.insert(bug.id);
+    family.retain(|member| readable_family.contains(&member.id));
+    for member in &mut family {
+        redact_inaccessible_duplicate_enrichments(member, &readable_by_principal);
+    }
+    let mut evidence = state
         .db
         .bug_evidence(&family)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    if !principal.has_global_bug_visibility()
+        && let Some(activity) = evidence.get_mut("activity").and_then(|a| a.as_array_mut())
+    {
+        activity.retain(|e| {
+            !matches!(
+                e.get("kind").and_then(|k| k.as_str()),
+                Some("candidate" | "raw_candidate")
+            )
+        });
+    }
+    val["evidence"] = evidence;
     if let Some(obj) = val.as_object_mut() {
         for key in [
             "raw_input",
@@ -1236,7 +1360,14 @@ async fn get_bug_enrichments(
     State(state): State<Arc<AppState>>,
     Query(query): Query<BugQuery>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    let bug = readable_bug(&state, &principal, &query).await?;
+    let mut bug = readable_bug(&state, &principal, &query).await?;
+    if !principal.has_global_bug_visibility() {
+        bug.enrichments
+            .retain(|e| e.kind != "candidate" && e.kind != "raw_candidate");
+    }
+    let refs = referenced_duplicate_ids(&bug);
+    let readable_refs = readable_bug_ids(&state, &principal, &refs).await?;
+    redact_inaccessible_duplicate_enrichments(&mut bug, &readable_refs);
     Ok(Json(
         serde_json::to_value(&bug.enrichments).unwrap_or_default(),
     ))
@@ -3950,7 +4081,7 @@ mod tests {
                 "subsystems": [{"name": section, "source": "maintainers_section"}]
             })).unwrap();
             let id = db.create_bug(&bug).await.unwrap();
-            for kind in ["report", "comment"] {
+            for kind in ["report", "comment", "candidate"] {
                 db.add_bug_enrichment(
                     id,
                     &crate::db::NewBugEnrichment {
@@ -3966,11 +4097,26 @@ mod tests {
             }
             ids.push(id);
         }
+        db.add_bug_enrichment(
+            ids[0],
+            &crate::db::NewBugEnrichment {
+                kind: "deduplication".into(),
+                content: Some("Deduplication Check completed".into()),
+                data_json: Some(serde_json::json!({
+                    "stage_id": "deduplication",
+                    "stage_title": "Deduplication Check"
+                })),
+                tool: "sashiko:linux_bug".into(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
         for &id in &ids[1..] {
             db.mark_bug_as_duplicate(crate::db::MarkDuplicateBugParams {
                 ephemeral_id: id,
                 canonical_id: ids[0],
-                reasoning: "same defect",
+                reasoning: "same defect as canonical",
                 ..Default::default()
             })
             .await
@@ -4018,7 +4164,7 @@ mod tests {
         ] {
             let principal = Principal::resolve(email, &acl, Some(&index));
             let Json(body) = get_bug(
-                principal,
+                Ok(principal.clone()),
                 State(state.clone()),
                 Query(BugQuery {
                     id: Some(id),
@@ -4030,25 +4176,170 @@ mod tests {
             .unwrap();
             assert_eq!(body["evidence"]["count"], count);
             let evidence = body["evidence"].to_string();
-            for name in excluded {
+            for name in &excluded {
                 assert!(
                     !evidence.contains(name),
                     "{email} learned about {name}: {evidence}"
                 );
             }
+            if email == "a@example.org" && id == ids[0] {
+                assert!(evidence.contains("Deduplication Check completed"));
+                let Json(enrichments) = get_bug_enrichments(
+                    principal.clone(),
+                    State(state.clone()),
+                    Query(BugQuery {
+                        id: Some(id),
+                        bugid: None,
+                        slug: None,
+                    }),
+                )
+                .await
+                .unwrap();
+                assert!(
+                    enrichments
+                        .to_string()
+                        .contains("Deduplication Check completed")
+                );
+            }
             if email == "b@example.org" {
                 assert!(body.get("duplicate_of_id").is_none());
                 assert!(body.get("duplicate_of").is_none());
+                assert!(!evidence.contains("hidden candidate confidential content"));
+
+                let Json(enrichments) = get_bug_enrichments(
+                    principal,
+                    State(state.clone()),
+                    Query(BugQuery {
+                        id: Some(id),
+                        bugid: None,
+                        slug: None,
+                    }),
+                )
+                .await
+                .unwrap();
+                let enrichments_str = enrichments.to_string();
+                assert!(!enrichments_str.contains("canonical"));
+                assert!(!enrichments_str.contains("hidden candidate confidential content"));
+                let items = enrichments.as_array().unwrap();
+                let audit_dup = items
+                    .iter()
+                    .find(|e| e["kind"] == "audit" && e["data_json"]["field"] == "duplicate_of_id")
+                    .expect("expected duplicate_of_id audit enrichment");
+                assert_eq!(audit_dup["content"], "Duplicate relationship updated");
+                assert_eq!(
+                    audit_dup["data_json"],
+                    serde_json::json!({ "field": "duplicate_of_id" })
+                );
+                let dedup = items
+                    .iter()
+                    .find(|e| e["kind"] == "deduplication")
+                    .expect("expected deduplication enrichment");
+                assert_eq!(dedup["content"], "Matched an existing bug");
+                assert!(dedup["data_json"].is_null());
             }
             if email == "operator@example.org" {
                 assert!(evidence.contains("hidden comment confidential content"));
                 assert!(evidence.contains("hidden-model"));
+                assert!(evidence.contains("same defect as canonical"));
+            }
+        }
+
+        // Anonymous capability read by bugid sees only that single bug's own
+        // evidence and never learns about its canonical or duplicate siblings.
+        for (bugid, excluded) in [
+            ("canonical", vec!["hidden", "sibling"]),
+            ("hidden", vec!["canonical", "sibling"]),
+        ] {
+            let Json(body) = get_bug(
+                Err((StatusCode::UNAUTHORIZED, "no token")),
+                State(state.clone()),
+                Query(BugQuery {
+                    id: None,
+                    bugid: Some(bugid.into()),
+                    slug: None,
+                }),
+            )
+            .await
+            .unwrap();
+            assert_eq!(body["bugid"], bugid);
+            assert_eq!(body["can_comment"], false);
+            assert_eq!(body["can_manage"], false);
+            assert_eq!(body["evidence"]["count"], 1);
+            let evidence = body["evidence"].to_string();
+            assert!(evidence.contains(&format!("{bugid} comment confidential content")));
+            assert!(!evidence.contains(&format!("{bugid} candidate confidential content")));
+            for name in excluded {
+                assert!(
+                    !evidence.contains(name),
+                    "anonymous bugid lookup for {bugid} leaked {name}: {evidence}"
+                );
+            }
+            assert!(body["duplicate_of_id"].is_null());
+            assert!(body.get("duplicate_of").is_none());
+            if let Some(dups) = body.get("duplicates").and_then(|d| d.as_array()) {
+                assert!(dups.is_empty());
+            }
+        }
+
+        // Re-parenting `hidden` (SECTION B) from `canonical` (SECTION A) to a
+        // readable SECTION B bug must still redact the historical audit and
+        // deduplication enrichments for `b@example.org`.
+        let b_canon_spec: crate::db::NewBug = serde_json::from_value(serde_json::json!({
+            "bugid": "b-canon", "title": "b-canon title", "reporter": "b@example.org",
+            "subsystems": [{"name": "SECTION B", "source": "maintainers_section"}]
+        }))
+        .unwrap();
+        let b_canon_id = state.db.create_bug(&b_canon_spec).await.unwrap();
+        state
+            .db
+            .mark_bug_as_duplicate(crate::db::MarkDuplicateBugParams {
+                ephemeral_id: ids[1],
+                canonical_id: b_canon_id,
+                reasoning: "re-parented to b-canon",
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let b_principal = Principal::resolve("b@example.org", &acl, Some(&index));
+        let Json(reparented_body) = get_bug(
+            Ok(b_principal.clone()),
+            State(state.clone()),
+            Query(BugQuery {
+                id: Some(ids[1]),
+                bugid: None,
+                slug: None,
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(
+            !reparented_body["evidence"]
+                .to_string()
+                .contains("canonical")
+        );
+        let Json(reparented_enrichments) = get_bug_enrichments(
+            b_principal,
+            State(state.clone()),
+            Query(BugQuery {
+                id: Some(ids[1]),
+                bugid: None,
+                slug: None,
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(!reparented_enrichments.to_string().contains("canonical"));
+        for item in reparented_enrichments.as_array().unwrap() {
+            if item["kind"] == "audit" && item["data_json"]["field"] == "duplicate_of_id" {
+                assert_eq!(
+                    item["data_json"],
+                    serde_json::json!({ "field": "duplicate_of_id" })
+                );
             }
         }
     }
 
     #[tokio::test]
-
     async fn test_bug_reads_require_an_authorized_principal() {
         const SECRET: &str = "bug-authz-secret-12345678901234567890";
         let db_settings = crate::settings::DatabaseSettings {
@@ -4125,8 +4416,8 @@ mod tests {
             req.send()
         };
 
-        // No credentials at all. Bug routes answer 401 rather than falling back
-        // to anything the transport might suggest.
+        // Sequential numeric ID lookups require authentication and subsystem
+        // authority.
         let anonymous = get(format!("/api/bug?id={}", bug_id), None).await.unwrap();
         assert_eq!(anonymous.status(), 401);
 
@@ -4135,25 +4426,95 @@ mod tests {
             .unwrap();
         assert_eq!(garbage.status(), 401);
 
-        // Authenticated, but maintains nothing and holds no capability. The
-        // answer has to be indistinguishable from a bug that is not there.
+        let anon_enrich_id = get(format!("/api/bug/enrichments?id={}", bug_id), None)
+            .await
+            .unwrap();
+        assert_eq!(anon_enrich_id.status(), 401);
+
+        // Authenticated, but maintains nothing and holds no capability. Lookup
+        // by sequential ID must be indistinguishable from an absent bug.
         let stranger = token("stranger@example.org");
         let denied = get(format!("/api/bug?id={}", bug_id), Some(stranger.clone()))
             .await
             .unwrap();
         assert_eq!(denied.status(), 404);
+        let denied_enrich_id = get(
+            format!("/api/bug/enrichments?id={}", bug_id),
+            Some(stranger.clone()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(denied_enrich_id.status(), 404);
         let absent = get("/api/bug?id=999999".to_string(), Some(stranger.clone()))
             .await
             .unwrap();
         assert_eq!(absent.status(), 404);
 
+        // Knowing the bugid or slug grants read-only access on GET /api/bug
+        // for both anonymous and unprivileged authenticated callers, while
+        // GET /api/bug/enrichments remains gated by Principal authority.
+        for bearer in [None, Some("nonsense".into()), Some(stranger.clone())] {
+            for query in ["bugid=linux-authz01", "slug=linux-authz01"] {
+                let res = get(format!("/api/bug?{}", query), bearer.clone())
+                    .await
+                    .unwrap();
+                assert_eq!(res.status(), 200);
+                let body: serde_json::Value = res.json().await.unwrap();
+                assert_eq!(body["bugid"], "linux-authz01");
+                assert_eq!(body["can_comment"], false);
+                assert_eq!(body["can_manage"], false);
+            }
+            let enrich_res = get(
+                "/api/bug/enrichments?bugid=linux-authz01".to_string(),
+                bearer.clone(),
+            )
+            .await
+            .unwrap();
+            let expected_enrich_status = if bearer.as_deref() == Some(stranger.as_str()) {
+                404
+            } else {
+                401
+            };
+            assert_eq!(enrich_res.status(), expected_enrich_status);
+
+            let missing_bugid = get(
+                "/api/bug?bugid=linux-does-not-exist".to_string(),
+                bearer.clone(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(missing_bugid.status(), 404);
+        }
+
+        // Raw transcript routes remain restricted even when bugid is known.
         for path in ["/api/bug/logs", "/api/bug/raw", "/api/bug/input"] {
             let res = get(format!("{}?id={}", path, bug_id), Some(stranger.clone()))
                 .await
                 .unwrap();
-            assert_eq!(res.status(), 404, "{} leaked to a stranger", path);
+            assert_eq!(res.status(), 404, "{} leaked to a stranger by id", path);
             let res = get(format!("{}?id={}", path, bug_id), None).await.unwrap();
             assert_eq!(res.status(), 401, "{} served without a session", path);
+            let res = get(
+                format!("{}?bugid=linux-authz01", path),
+                Some(stranger.clone()),
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                res.status(),
+                404,
+                "{} leaked existence to stranger with bugid",
+                path
+            );
+            let res = get(format!("{}?bugid=linux-authz01", path), None)
+                .await
+                .unwrap();
+            assert_eq!(
+                res.status(),
+                401,
+                "{} served by bugid without a session",
+                path
+            );
         }
 
         let listing: serde_json::Value = get("/api/bugs".to_string(), Some(stranger.clone()))
@@ -4174,16 +4535,19 @@ mod tests {
                 .unwrap();
         assert!(facets.as_array().unwrap().is_empty());
 
-        // The operator sees everything.
+        // The operator sees everything and keeps full management rights by id
+        // and by bugid.
         let operator = token("operator@example.org");
-        let allowed = get(format!("/api/bug?id={}", bug_id), Some(operator.clone()))
-            .await
-            .unwrap();
-        assert_eq!(allowed.status(), 200);
-        let body: serde_json::Value = allowed.json().await.unwrap();
-        assert_eq!(body["bugid"], "linux-authz01");
-        assert_eq!(body["can_comment"], true);
-        assert_eq!(body["can_manage"], true);
+        for query in [format!("id={}", bug_id), "bugid=linux-authz01".to_string()] {
+            let allowed = get(format!("/api/bug?{}", query), Some(operator.clone()))
+                .await
+                .unwrap();
+            assert_eq!(allowed.status(), 200);
+            let body: serde_json::Value = allowed.json().await.unwrap();
+            assert_eq!(body["bugid"], "linux-authz01");
+            assert_eq!(body["can_comment"], true);
+            assert_eq!(body["can_manage"], true);
+        }
 
         let listing: serde_json::Value = get("/api/bugs".to_string(), Some(operator))
             .await
@@ -4193,8 +4557,7 @@ mod tests {
             .unwrap();
         assert_eq!(listing["total"], 1);
 
-        // Mutations are not bypassable from loopback either, even though every
-        // capability in the Permission enum is.
+        // Mutations are not bypassable from loopback or by knowing bugid.
         let unauthenticated_action = client
             .post(format!("http://{}/api/bug/action?id={}", addr, bug_id))
             .json(&serde_json::json!({"action": "comment", "content": "hello"}))
@@ -4202,6 +4565,29 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(unauthenticated_action.status(), 401);
+
+        let unauthenticated_bugid_action = client
+            .post(format!(
+                "http://{}/api/bug/action?bugid=linux-authz01",
+                addr
+            ))
+            .json(&serde_json::json!({"action": "comment", "content": "hello"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(unauthenticated_bugid_action.status(), 401);
+
+        let stranger_bugid_action = client
+            .post(format!(
+                "http://{}/api/bug/action?bugid=linux-authz01",
+                addr
+            ))
+            .header("Authorization", format!("Bearer {}", stranger))
+            .json(&serde_json::json!({"action": "comment", "content": "hello"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(stranger_bugid_action.status(), 404);
 
         // Filing a bug spends money, so it needs the create capability. The
         // principal is resolved before the body is, so an anonymous caller is

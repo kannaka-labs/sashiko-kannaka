@@ -154,6 +154,13 @@ subsystem gets `Manage` (`test_strongest_grant_wins`).
 - `Principal` is a **fallible** extractor: no valid session ⇒ 401, so a bug
   route cannot reach bug data without naming it in its signature. That is the
   only structural protection in this file; everything past it is hand-written.
+  `get_bug` is the sole exception that extracts
+  `Result<Principal, (StatusCode, &'static str)>` and passes it to
+  `resolve_bug_read_principal(&query)`: when `query.by_bugid()` is true (the
+  caller supplied the 122-bit random `bugid` / `slug` without a numeric `id`),
+  missing or expired credentials degrade to `Principal::anonymous()` for a
+  single-bug capability read; when `query.by_bugid()` is false (`?id=<i64>`),
+  the `401` rejection is preserved.
 - `OptionalPrincipal` degrades to `Principal::anonymous()`. Used by
   `get_patchset`, `get_review`, `get_review_log`, which stay publicly readable
   and instead call `redact_embedded_bugs` to drop the `bugs` array members the
@@ -172,7 +179,14 @@ subsystem gets `Manage` (`test_strongest_grant_wins`).
   a directory prefix is a type error. Do not accept a diff that compares raw
   `String` subsystem names in an authorization path.
 - Helpers, and what each guarantees:
-  - `readable_bug` → 404 for both "absent" and "not yours", byte for byte.
+  - `readable_bug` → 404 for both "absent" and "not yours", byte for byte
+    (evaluates `bug_access` with `by_bugid = false`).
+  - `readable_bug_for_view` → used only by `get_bug`; evaluates
+    `bug_access_for_query(..., query.by_bugid())` so knowing a bug's `bugid` /
+    `slug` grants `BugAccess::Read` on that single bug (unless attenuated by a
+    token's `max_bug_access = "none"` ceiling), while counterpart bugs in
+    `attach_duplicate_relations` and `bug_family` are still filtered by the
+    caller's `Principal` authority (`by_bugid = false`).
   - `bug_access` → the level, for a handler that must compare against a
     required level.
   - `readable_bug_ids` → batch filter, one query.
@@ -217,7 +231,7 @@ when the payload changes.
 | `POST /api/auth/request-link` | `request_link` | rate limiter + `is_sign_in_eligible`; always answers 200 |
 | `GET /api/auth/verify` | `verify_link` | `typ == "sign_in_link"` + blocklist |
 | `POST /api/auth/refresh` | `refresh_token` | session + blocklist + 30-day `iat` cap |
-| `GET /api/bug` | `get_bug` | `Principal` + `readable_bug` (Read) |
+| `GET /api/bug` | `get_bug` | `resolve_bug_read_principal` + `readable_bug_for_view` (capability Read by `bugid`/`slug`; `Principal` required for `id`) |
 | `GET /api/bug/enrichments` | `get_bug_enrichments` | `Principal` + `readable_bug` |
 | `GET /api/bugs` | `list_bugs` | `Principal` + `visibility()` in SQL |
 | `GET /api/bugs/subsystems`, `GET /api/subsystems` | `list_bug_subsystems` | `Principal` + `visibility()`, scope-keyed cache |
