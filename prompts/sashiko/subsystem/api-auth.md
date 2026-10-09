@@ -126,11 +126,13 @@ reintroduces the bypass removed in `56773cd43da9`.
 
 `settings.server.read_only` is copied into `AppState::read_only` in
 `build_router`. Every mutating handler must check it **first**, before any
-other work: `submit_patch`, `rerun_patchset`, `cancel_patchset`, `rerun_patch`,
-`analyze_bug`, `bug_action`, `forge_webhook`. It is also folded into the
-advisory flags `get_config` reports (`permissions.review/cancel/ingest`) and
-into `can_comment`/`can_manage` in `get_bug` — those are UI hints, not
-enforcement; the enforcement is the handler's own early return.
+other work: `submit_patch`, `rerun_patchset`, `release_patchset_embargo`,
+`cancel_patchset`, `rerun_patch`, `analyze_bug`, `bug_action`, `forge_webhook`.
+It is also folded into the advisory flags `get_config` reports
+(`permissions.review/cancel/ingest`), `can_release_embargo` in
+`get_patchset`/`get_patchset_summary`, and `can_comment`/`can_manage` in
+`get_bug` — those are UI hints, not enforcement; the enforcement is the
+handler's own early return.
 
 ### `--enable-unsafe-all-submit`
 
@@ -162,9 +164,10 @@ subsystem gets `Manage` (`test_strongest_grant_wins`).
   single-bug capability read; when `query.by_bugid()` is false (`?id=<i64>`),
   the `401` rejection is preserved.
 - `OptionalPrincipal` degrades to `Principal::anonymous()`. Used by
-  `get_patchset`, `get_review`, `get_review_log`, which stay publicly readable
-  and instead call `redact_embedded_bugs` to drop the `bugs` array members the
-  caller may not read.
+  `get_patchset`, `get_patchset_summary`, `get_review`, `get_review_log`, which
+  stay publicly readable and instead call `redact_embedded_bugs` to drop the
+  `bugs` array members the caller may not read (and compute
+  `can_release_embargo` on embargoed patchsets).
 - Per-bug authority comes from `Database::authorizing_sections_for_bug(s)`,
   which selects only rows with `source = 'maintainers_section'`. A
   `path_prefix` or `caller_supplied` subsystem names nobody and confers
@@ -218,13 +221,14 @@ when the payload changes.
 | `GET /api/patchsets` | `list_patchsets` | — |
 | `GET /api/messages` | `list_messages` | — |
 | `GET /api/message` | `get_message` | — |
-| `GET /api/patchset` | `get_patchset_summary` | — (payload carries no `bugs` key) |
+| `GET /api/patchset` | `get_patchset_summary` | `OptionalPrincipal` (computes `can_release_embargo`; payload carries no `bugs` key) |
 | `GET /api/stats`, `/api/stats/timeline`, `/api/stats/reviews`, `/api/stats/tools` | `get_stats`, `stats_*` | — |
-| `GET /api/patch` | `get_patchset` | `OptionalPrincipal` + `redact_embedded_bugs` |
+| `GET /api/patch` | `get_patchset` | `OptionalPrincipal` + `redact_embedded_bugs` (and computes `can_release_embargo`) |
 | `GET /api/review` | `get_review` | `OptionalPrincipal` + `redact_embedded_bugs` |
 | `GET /api/review_log` | `get_review_log` | `OptionalPrincipal` + `redact_embedded_bugs` |
 | `POST /api/submit` | `submit_patch` | `read_only` + `Permission::Ingest` |
 | `POST /api/patchset/rerun` | `rerun_patchset` | `read_only` + `Permission::Review` |
+| `POST /api/patchset/release-embargo` | `release_patchset_embargo` | `read_only` + (`Permission::Review` or `principal.may_release_embargo(&authorizing_sections_for_patchset)`) |
 | `POST /api/patch/rerun` | `rerun_patch` | `read_only` + `Permission::Review` |
 | `POST /api/patchset/cancel` | `cancel_patchset` | `read_only` + `Permission::Cancel` |
 | `POST /api/webhook/{provider}` | `forge_webhook` | `read_only` + webhook secret, else local token, else `allow_all_submit` (see forge.md) |
