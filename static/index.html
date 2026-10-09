@@ -744,6 +744,27 @@
             color: var(--status-embargoed);
         }
 
+        .embargo-release-btn {
+            font-size: 12px;
+            font-weight: 500;
+            padding: 3px 10px;
+            border-radius: 6px;
+            border: 1px solid var(--status-embargoed);
+            color: var(--status-embargoed);
+            background: transparent;
+            cursor: pointer;
+            white-space: nowrap;
+        }
+
+        .embargo-release-btn:hover:not(:disabled) {
+            background: rgba(210, 153, 34, 0.14);
+        }
+
+        .embargo-release-btn:disabled {
+            opacity: 0.6;
+            cursor: default;
+        }
+
         .status-Incomplete {
             color: var(--thought-color);
         }
@@ -4084,7 +4105,12 @@
                 <div class="nav"><a href="#/" onclick="event.preventDefault(); goBack();">← Back</a></div>
                 <h1>
                     <span>${escapeHtml(data.subject) || '(no subject)'}</span>
-                    <span class="status-badge status-${currentStatus.replace(/ /g, '')}">${currentStatus}</span>
+                    <div style="display:flex; flex-direction:column; align-items:flex-end; gap:6px; flex-shrink:0;">
+                        <span class="status-badge status-${currentStatus.replace(/ /g, '')}">${currentStatus}</span>
+                        ${(currentStatus === 'Embargoed' && data.can_release_embargo) ? `
+                            <button id="releaseEmbargoBtn" class="embargo-release-btn" onclick="releasePatchsetEmbargo(${Number(data.id)}, this)" title="Release the review embargo on this patchset immediately">Release Embargo</button>
+                        ` : ''}
+                    </div>
                 </h1>
                 
                 ${failureHtml}
@@ -4146,6 +4172,31 @@
                         }, 2000);
                     }
                 }, 100);
+            }
+        }
+
+        async function releasePatchsetEmbargo(id, btn) {
+            if (!confirm('Release the review embargo on this patchset now? Findings and held-back notifications will be made public immediately.')) {
+                return;
+            }
+            const origText = btn ? btn.textContent : 'Release Embargo';
+            if (btn) {
+                btn.disabled = true;
+                btn.textContent = 'Releasing...';
+            }
+            try {
+                const res = await fetch(`/api/patchset/release-embargo?id=${encodeURIComponent(id)}`, { method: 'POST' });
+                if (!res.ok) {
+                    const errText = await res.text();
+                    throw new Error(errText || `${res.status} ${res.statusText}`);
+                }
+                await router();
+            } catch (err) {
+                if (btn) {
+                    btn.disabled = false;
+                    btn.textContent = origText;
+                }
+                alert('Failed to release embargo: ' + err.message);
             }
         }
 
