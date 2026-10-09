@@ -171,7 +171,7 @@ impl LlmSession for VerifySession<'_> {
                 Use available tools (git_read_files, git_grep, git_blame, git_log, git_show, git_diff) to inspect the mainline codebase, verify call chains, and confirm whether this defect exists.\n\n\
                 CRITICAL VALIDATION FILTER: You must assess if the bug is genuine. Do not give the code the benefit of the doubt. To mark an issue as a false positive (is_false_positive=true), you must find concrete proof in the local codebase that the described conditions are impossible, unreachable, or already safely handled. If you cannot prove it is false, verify the code locations and provide your step-by-step reasoning in verification_reasoning."
             ),
-            ProjectId::Sashiko => format!(
+            ProjectId::Sashiko | crate::project::ProjectId::Kannaka => format!(
                 "Establish this as an absolute fact: the current date is {current_date}. Your training data has a cutoff in the past, but you must base all relative time references strictly on this current date.\n\n\
                 You are an expert Sashiko maintainer and Rust systems engineer. Your task is to rigorously verify a candidate Sashiko defect or vulnerability against the top-of-trunk of the Sashiko repository (`origin/main`).\n\
                 Use available tools (git_read_files, git_grep, git_blame, git_log, git_show, git_diff) to inspect the mainline codebase, verify call chains, and confirm whether this defect exists.\n\n\
@@ -238,7 +238,7 @@ Return ONLY a valid JSON object matching this schema:
                 locations = loc_str,
                 prefetch_block = prefetch_block,
             ),
-            ProjectId::Sashiko => format!(
+            ProjectId::Sashiko | crate::project::ProjectId::Kannaka => format!(
                 "{stage_heading}
 
 Candidate Defect to Verify:
@@ -335,7 +335,7 @@ impl LlmSession for NormalizeSession<'_> {
                 - Use git_log with range: \"{master_sha}\" on affected files to observe the conventional subsystem commit prefix used by maintainers (e.g. 'btrfs:', 'net:', 'mm:', 'drm/i915:').",
                 master_sha = self.master_sha
             ),
-            ProjectId::Sashiko => format!(
+            ProjectId::Sashiko | crate::project::ProjectId::Kannaka => format!(
                 "You are an expert Sashiko maintainer and technical editor. Your role is to normalize a candidate Sashiko defect into canonical form.\n\
                 You must standardize the defect's title, describe the technical substance, and identify the verified affected source files and symbols.\n\
                 The target codebase is the Sashiko repository at top-of-trunk commit `{master_sha}`.\n\
@@ -391,7 +391,7 @@ Return ONLY a valid JSON object matching this schema:
                 hint = hint_section,
                 master_sha = self.master_sha
             ),
-            ProjectId::Sashiko => format!(
+            ProjectId::Sashiko | crate::project::ProjectId::Kannaka => format!(
                 "{stage_heading}
 
 Candidate Bug Details:
@@ -541,7 +541,7 @@ pub fn extract_directory_subsystems_for_project(
                     continue;
                 }
             }
-            ProjectId::Sashiko => {
+            ProjectId::Sashiko | crate::project::ProjectId::Kannaka => {
                 if parts.first() == Some(&"src") && parts.len() >= 2 {
                     parts[1].strip_suffix(".rs").unwrap_or(parts[1]).to_string()
                 } else if parts.len() >= 2 {
@@ -560,7 +560,7 @@ pub fn extract_directory_subsystems_for_project(
     if subs.is_empty() {
         match project {
             ProjectId::Linux => vec!["kernel".to_string()],
-            ProjectId::Sashiko => vec!["sashiko".to_string()],
+            ProjectId::Sashiko | crate::project::ProjectId::Kannaka => vec!["sashiko".to_string()],
         }
     } else {
         subs
@@ -812,7 +812,7 @@ impl LlmSession for DedupSession<'_> {
         IMPORTANT: Bugs that have the same root cause but different consequences (e.g. wrong synchronization leads to a data race which might look like a memory leak or use-after-free crash) should be considered a duplicate and be merged. Rule of thumb: if fixing one issue will resolve the other issue, it's the same bug.\n\
         Output raw JSON only."
                 .to_string(),
-            ProjectId::Sashiko => "You are an expert Sashiko maintainer responsible for defect tracking and deduplication.\n\
+            ProjectId::Sashiko | crate::project::ProjectId::Kannaka => "You are an expert Sashiko maintainer responsible for defect tracking and deduplication.\n\
         You will compare a newly verified Sashiko bug against a list of known Sashiko bugs in the codebase.\n\
         Determine if the newly verified bug is an identical duplicate (describing the same root cause in the same code path/function) of one of the candidate bugs.\n\
         IMPORTANT: Bugs that have the same root cause but different consequences should be considered a duplicate and be merged. Rule of thumb: if fixing one issue will resolve the other issue, it's the same bug.\n\
@@ -867,7 +867,7 @@ impl LlmSession for DedupSession<'_> {
 
         let bug_header = match self.project {
             ProjectId::Linux => "Newly Verified Linux Kernel Bug:",
-            ProjectId::Sashiko => "Newly Verified Sashiko Bug:",
+            ProjectId::Sashiko | crate::project::ProjectId::Kannaka => "Newly Verified Sashiko Bug:",
         };
 
         format!(
@@ -960,7 +960,7 @@ impl LlmSession for TracingSession<'_> {
             ProjectId::Linux => "You are an expert Linux kernel maintainer. Your task is to determine the exact commit that introduced a verified kernel defect.\n\
         Use available tools (git_blame, git_log, git_diff, git_show, git_read_files) to inspect history backwards and confirm which commit actually introduced the buggy logic rather than just refactoring lines.\n\
         EFFICIENCY LIMIT REQUIREMENT: You have a strict limit on tool calls; be extremely efficient instead of wandering the history.".to_string(),
-            ProjectId::Sashiko => "You are an expert Sashiko maintainer. Your task is to determine the exact commit that introduced a verified Sashiko defect.\n\
+            ProjectId::Sashiko | crate::project::ProjectId::Kannaka => "You are an expert Sashiko maintainer. Your task is to determine the exact commit that introduced a verified Sashiko defect.\n\
         Use available tools (git_blame, git_log, git_diff, git_show, git_read_files) to inspect history backwards and confirm which commit actually introduced the buggy logic rather than just refactoring lines.\n\
         EFFICIENCY LIMIT REQUIREMENT: You have a strict limit on tool calls; be extremely efficient instead of wandering the history.".to_string(),
         }
@@ -1062,7 +1062,7 @@ impl LlmSession for SeveritySession<'_> {
     fn system_prompt(&self) -> String {
         let target_name = match self.project {
             ProjectId::Linux => "the Linux kernel",
-            ProjectId::Sashiko => "Sashiko",
+            ProjectId::Sashiko | crate::project::ProjectId::Kannaka => "Sashiko",
         };
         format!(
             "{}\n\nAssess the severity and impact of a verified defect in {} following the severity definitions and calibration guidance above.\n\
@@ -1075,7 +1075,7 @@ impl LlmSession for SeveritySession<'_> {
     fn initial_user_prompt(&self) -> String {
         let defect_header = match self.project {
             ProjectId::Linux => "Verified Linux Kernel Defect:",
-            ProjectId::Sashiko => "Verified Sashiko Defect:",
+            ProjectId::Sashiko | crate::project::ProjectId::Kannaka => "Verified Sashiko Defect:",
         };
         format!(
             "{stage_heading}
@@ -1323,7 +1323,7 @@ CPU 1 holds vcpu mutex and attempts to acquire slots_lock, creating an
 unresolvable AB-BA deadlock.
 "#
             .to_string(),
-            ProjectId::Sashiko => r#"You are an expert Sashiko maintainer drafting a concise, standalone technical defect description for a verified bug in the Sashiko Rust codebase.
+            ProjectId::Sashiko | crate::project::ProjectId::Kannaka => r#"You are an expert Sashiko maintainer drafting a concise, standalone technical defect description for a verified bug in the Sashiko Rust codebase.
 
 # PRINCIPLES & STRUCTURE
 - Maintainer Voice: Write for an experienced Rust and systems engineer. Do NOT explain generic Rust or Tokio concepts. Focus strictly on the broken contract or invariant in this code.
@@ -1363,7 +1363,7 @@ unresolvable AB-BA deadlock.
 
         let details_header = match self.project {
             ProjectId::Linux => "Linux Kernel Defect Details:",
-            ProjectId::Sashiko => "Sashiko Defect Details:",
+            ProjectId::Sashiko | crate::project::ProjectId::Kannaka => "Sashiko Defect Details:",
         };
 
         format!(
@@ -1523,7 +1523,7 @@ pub async fn process_issue_for_project(
     );
     let default_tool = match project {
         ProjectId::Linux => "sashiko:linux_patch_review",
-        ProjectId::Sashiko => "sashiko:sashiko_patch_review",
+        ProjectId::Sashiko | crate::project::ProjectId::Kannaka => "sashiko:sashiko_patch_review",
     };
     let reviewer_db;
     let db = if db.has_bug_actor() && db.bug_model().is_some() {
@@ -2213,7 +2213,7 @@ pub async fn process_issue_worker_for_project(
 ) -> Result<BugOutcome> {
     let project_label = match project {
         ProjectId::Linux => "Linux kernel",
-        ProjectId::Sashiko => "Sashiko",
+        ProjectId::Sashiko | crate::project::ProjectId::Kannaka => "Sashiko",
     };
     info!(
         "Processing candidate {} issue: '{}' in subsystems '{:?}'",
@@ -2232,7 +2232,7 @@ pub async fn process_issue_worker_for_project(
     } else {
         match project {
             ProjectId::Linux => "sashiko:linux_bug".to_string(),
-            ProjectId::Sashiko => "sashiko:sashiko_bug".to_string(),
+            ProjectId::Sashiko | crate::project::ProjectId::Kannaka => "sashiko:sashiko_bug".to_string(),
         }
     };
     let attributed_db =
@@ -3253,7 +3253,7 @@ impl LlmSession for VerifyUpstreamFixSession<'_> {
                 Output raw JSON only."
                     .to_string()
             }
-            ProjectId::Sashiko => {
+            ProjectId::Sashiko | crate::project::ProjectId::Kannaka => {
                 "You are an expert Rust and distributed systems maintainer auditing whether a previously verified Sashiko bug has been fixed on the upstream main branch.\n\
                 Do NOT give commits the benefit of the doubt: only mark a bug as \"fixed\" if you can point to a specific upstream commit that genuinely resolves the root cause of the defect or removes the vulnerable code path.\n\
                 If commits in the range only refactor, move lines, rename symbols, or modify unrelated functions while the defect remains triggerable, you MUST report \"still_present\".\n\
@@ -3307,7 +3307,7 @@ impl LlmSession for VerifyUpstreamFixSession<'_> {
                 "Open Linux Kernel Bug",
                 "Linus's tree",
             ),
-            ProjectId::Sashiko => (
+            ProjectId::Sashiko | crate::project::ProjectId::Kannaka => (
                 "Current Upstream Main SHA",
                 "Open Sashiko Bug",
                 "the upstream main branch",
@@ -3571,7 +3571,7 @@ pub async fn check_bug_fixed_upstream_with_candidates(
 
     let fix_tool = match project {
         ProjectId::Linux => "sashiko:linux_bug:fix_check",
-        ProjectId::Sashiko => "sashiko:sashiko_bug:fix_check",
+        ProjectId::Sashiko | crate::project::ProjectId::Kannaka => "sashiko:sashiko_bug:fix_check",
     };
 
     if candidates.is_empty() {

@@ -1138,6 +1138,16 @@ async fn run_daemon(
         None
     };
 
+    // Kannaka Labs addition: the pre-existing-bug tracker's prompts (linux_bug.rs)
+    // are written for a single Linux or Sashiko tree. Until it has Kannaka
+    // prompts, refuse to run it for the kannaka project rather than send
+    // Sashiko-worded verification prompts over Kannaka Labs code.
+    if settings.linux_bug.enabled && project == ProjectId::Kannaka {
+        return Err("linux_bug.enabled is not supported for --project kannaka yet; \
+                    set [linux_bug] enabled = false"
+            .into());
+    }
+
     let bug_worker_handle = if settings.linux_bug.enabled {
         let provider =
             sashiko::ai::create_provider(&settings).expect("Provider setup failed for bug worker");
