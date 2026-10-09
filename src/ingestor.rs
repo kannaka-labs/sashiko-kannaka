@@ -84,36 +84,51 @@ impl Ingestor {
     }
 
     async fn get_tracked_groups(&self) -> Result<Vec<(String, String)>> {
-        let mut groups = Vec::new();
-        let mut available_groups: Option<Vec<String>> = None;
+        let needs_dynamic_resolution = self
+            .settings
+            .mailing_lists
+            .track
+            .iter()
+            .any(|entry| !entry.contains(':') && !entry.contains('.') && entry != "linux-mm");
 
-        for entry in &self.settings.mailing_lists.track {
-            if !entry.contains(':') && !entry.contains('.') && available_groups.is_none() {
-                match NntpClient::connect(
-                    &self.settings.nntp.server,
-                    self.settings.nntp.port,
-                    self.settings.nntp.tls,
-                )
-                .await
-                {
-                    Ok(mut client) => match client.list().await {
-                        Ok(list) => available_groups = Some(list),
-                        Err(e) => {
-                            warn!(
-                                "Failed to fetch NNTP group list for dynamic resolution: {}",
-                                e
-                            )
-                        }
-                    },
+        let mut available_groups: Option<Vec<String>> = None;
+        if needs_dynamic_resolution {
+            match NntpClient::connect(
+                &self.settings.nntp.server,
+                self.settings.nntp.port,
+                self.settings.nntp.tls,
+            )
+            .await
+            {
+                Ok(mut client) => match client.list().await {
+                    Ok(list) => available_groups = Some(list),
                     Err(e) => {
-                        warn!("Failed to connect to NNTP for dynamic resolution: {}", e)
+                        warn!(
+                            "Failed to fetch NNTP group list for dynamic resolution: {}",
+                            e
+                        );
                     }
+                },
+                Err(e) => {
+                    warn!("Failed to connect to NNTP for dynamic resolution: {}", e);
                 }
             }
 
-            let (name, group) = resolve_tracked_group(entry, available_groups.as_deref());
-            groups.push((name, group));
+            if available_groups.is_none()
+                && let Ok(existing) = self.db.get_mailing_lists().await
+                && !existing.is_empty()
+            {
+                available_groups = Some(existing.into_iter().map(|(_, group)| group).collect());
+            }
         }
+
+        let groups = self
+            .settings
+            .mailing_lists
+            .track
+            .iter()
+            .map(|entry| resolve_tracked_group(entry, available_groups.as_deref()))
+            .collect();
         Ok(groups)
     }
 
@@ -149,15 +164,9 @@ impl Ingestor {
         for (name, group) in groups {
             let mut group_remaining = limit_per_group;
 
-            // Ensure the mailing list exists in the DB so messages can be linked to it
-            // We use &group because ensure_mailing_list expects &str
-            if let Err(e) = self.db.ensure_mailing_list(&name, &group).await {
-                error!("Failed to ensure mailing list {} exists: {}", group, e);
-                // Continue anyway; linking may fail if the list doesn't exist.
-            }
-
             match self.resolve_git_info(&group).await {
                 Ok((epochs, base_path)) => {
+                    let mut ensured = false;
                     for (epoch, url) in epochs {
                         if group_remaining == 0 {
                             break;
@@ -178,6 +187,12 @@ impl Ingestor {
                         {
                             error!("Failed to bootstrap group {} epoch {}: {}", group, epoch, e);
                             continue;
+                        }
+                        if !ensured {
+                            if let Err(e) = self.db.ensure_mailing_list(&name, &group).await {
+                                error!("Failed to ensure mailing list {} exists: {}", group, e);
+                            }
+                            ensured = true;
                         }
                         match self
                             .ingest_git_objects(&group, &epoch_path, Some(group_remaining))
@@ -383,7 +398,6 @@ impl Ingestor {
 
         'groups: for (name, group_name) in self.get_tracked_groups().await? {
             let group_name = &group_name;
-            self.db.ensure_mailing_list(&name, group_name).await?;
 
             let info = match client.group(group_name).await {
                 Ok(i) => i,
@@ -401,6 +415,7 @@ impl Ingestor {
                     continue;
                 }
             };
+            self.db.ensure_mailing_list(&name, group_name).await?;
             let last_known = self.db.get_last_article_num(group_name).await?;
 
             info!(

@@ -2123,11 +2123,25 @@ impl Database {
     pub async fn get_mailing_lists(&self) -> Result<Vec<(String, String)>> {
         let mut rows = self
             .conn
-            .query("SELECT name, nntp_group FROM mailing_lists", ())
+            .query(
+                "SELECT name, nntp_group
+                 FROM mailing_lists
+                 WHERE last_article_num > 0
+                    OR EXISTS (
+                        SELECT 1 FROM messages_mailing_lists mml
+                        WHERE mml.mailing_list_id = mailing_lists.id
+                    )
+                 ORDER BY name ASC, last_article_num DESC",
+                (),
+            )
             .await?;
-        let mut lists = Vec::new();
+        let mut lists: Vec<(String, String)> = Vec::new();
         while let Ok(Some(row)) = rows.next().await {
-            lists.push((row.get(0)?, row.get(1)?));
+            let name: String = row.get(0)?;
+            let group: String = row.get(1)?;
+            if lists.last().is_none_or(|(prev_name, _)| prev_name != &name) {
+                lists.push((name, group));
+            }
         }
         Ok(lists)
     }
@@ -5496,6 +5510,18 @@ impl Database {
     }
 
     pub async fn ensure_mailing_list(&self, name: &str, group: &str) -> Result<()> {
+        self.execute(
+            "DELETE FROM mailing_lists
+             WHERE name = ?
+               AND nntp_group != ?
+               AND last_article_num = 0
+               AND NOT EXISTS (
+                   SELECT 1 FROM messages_mailing_lists mml
+                   WHERE mml.mailing_list_id = mailing_lists.id
+               )",
+            libsql::params![name, group],
+        )
+        .await?;
         self.execute(
             "INSERT INTO mailing_lists (name, nntp_group, last_article_num) VALUES (?, ?, 0)
                  ON CONFLICT(nntp_group) DO UPDATE SET name = excluded.name",
@@ -13861,6 +13887,41 @@ mod tests {
             .unwrap();
         let found_b = psets_b.iter().any(|p| p.id == ps_b);
         assert!(!found_b);
+    }
+
+    #[tokio::test]
+    async fn test_get_mailing_lists_excludes_phantom_and_deduplicates() {
+        let db = setup_db().await;
+
+        // Simulate a transient fallback inserting a phantom group with 0 watermark and no messages
+        db.ensure_mailing_list("damon", "org.kernel.vger.damon")
+            .await
+            .unwrap();
+        db.ensure_mailing_list("kvarm", "org.kernel.vger.kvarm")
+            .await
+            .unwrap();
+
+        // Phantom groups with last_article_num = 0 and no messages should not appear in /api/lists
+        assert!(db.get_mailing_lists().await.unwrap().is_empty());
+
+        // Ensuring the real group for "damon" prunes the uninitialized phantom duplicate
+        db.ensure_mailing_list("damon", "dev.linux.lists.damon")
+            .await
+            .unwrap();
+        db.update_last_article_num("dev.linux.lists.damon", 500)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            db.get_mailing_list_id_by_name("org.kernel.vger.damon")
+                .await
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            db.get_mailing_lists().await.unwrap(),
+            vec![("damon".to_string(), "dev.linux.lists.damon".to_string())]
+        );
     }
 
     #[tokio::test]
