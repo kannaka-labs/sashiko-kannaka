@@ -20,12 +20,7 @@ You're an expert Software Engineer with deep knowledge of Rust, Distributed Syst
 
 # Development Workflow
 
-## 1. Prerequisites
-Install the following tools to manage the development lifecycle:
-- **make:** Command runner for project tasks. (Usually pre-installed or available via `build-essential` on Debian/Ubuntu).
-- **yamllint:** Linter for YAML files. [Installation Guide](https://github.com/adrienverge/yamllint#installation)
-
-## 2. Common Commands
+## 1. Common Commands
 Use `make` to run common development tasks:
 - `make lint`: Run all linters (`clippy`, `fmt`, `yamllint`).
 - `make lint-local` / `make lint-local-cache`: Run `clippy` on minimal local-review feature profiles (`--no-default-features` and `--features cache`).
@@ -34,7 +29,7 @@ Use `make` to run common development tasks:
 - `make check-all`: Run the complete suite unconditionally (`lint`, `lint-local`, `lint-local-cache`, `test`, `check-db-invariants`).
 - `make check-db-invariants`: Run lightweight database invariant checks.
 
-## 3. Self-Review (Sashiko for Sashiko)
+## 2. Self-Review (Sashiko for Sashiko)
 Sashiko reviews changes to its own repository using the `--project sashiko` profile in a two-stage development loop:
 - **Workflow & Prompts:** Defined by `src/workflows/sashiko_patch_review.rs` and first-party prompt guides under `prompts/sashiko/` (distinct from the vendored upstream prompts in `third_party/prompts/`).
 - **Scope:** Audits Sashiko-specific invariants across subsystems (`prompts/sashiko/subsystem/*.md`) and cross-cutting patterns (`prompts/sashiko/patterns/*.md`), including UX, SQLite migrations and query scaling, email delivery safety, untrusted input boundaries, Tokio/async discipline, and commit message hygiene. Deterministic checks (compilation, borrow checking, formatting, clippy lints) are handled by `make check-pr`.
@@ -45,166 +40,72 @@ Sashiko reviews changes to its own repository using the `--project sashiko` prof
 
 # Rust Coding Standards
 
-## 1. Idiomatic Rust
-
-- **Version:** Make sure the code can be compiled with Rust 1.90, don't use unstable new features.
-- **Safety First:** Prioritize safe Rust. Only use `unsafe` blocks when absolutely necessary and document the safety invariant clearly.
-- **Error Handling:** Use `Result<T, E>` for recoverable errors. Avoid `.unwrap()` and `.expect()` in production code unless you can statically prove it will never panic (and document why). Prefer `?` operator for error propagation.
-- **Ownership & Borrowing:** Leverage the borrow checker. Prefer borrowing (`&T`, `&mut T`) over cloning (`.clone()`) unless necessary for ownership transfer.
-- **Iterators:** Use iterator chains (`map`, `filter`, `fold`, etc.) over explicit `for` loops where it increases clarity and conciseness.
-- **Clippy:** Ensure code passes `cargo clippy`. Respect its suggestions.
-- **Formatting:** Code must be formatted with `rustfmt` (`cargo fmt`).
-
-## 2. Complexity & Structure
-
-- **Cyclomatic Complexity:** Keep cyclomatic complexity low (target < 15). If a function has too many branches or loops, refactor it.
-- **Function Length:** Avoid excessively long functions. A function should ideally fit on a single screen (soft limit of ~50 lines) or focus on a single responsibility. Break down large functions into smaller helper functions.
-- **Modules:** Use the module system effectively to organize code logically. Keep public APIs clean and minimal.
-
-## 3. Comments
-
-- **Statements, Not Questions:** Comments should explain *why* something is done or clarify complex logic. They must be declarative statements.
-  - **Bad:** `// Should we check for null here?`
-  - **Good:** `// Check for null to prevent panic during initialization.`
-- **Doc Comments:** Use `///` for documentation comments on public items. Include examples where helpful.
-
-## 4. Code Reuse (DRY)
-
-- **Aggressive Reuse:** Do not duplicate code. If logic appears in multiple places, extract it into a shared function, struct, or trait.
-- **Generic Programming:** Use generics and traits to write flexible, reusable code rather than duplicating logic for different types.
-- **Libraries:** leverage standard library and existing crate dependencies before writing custom implementations.
-
-## 5. Testing
-
-- **Unit Tests:** Write unit tests for new logic, ideally in the same file within a `tests` module.
-- **Integration Tests:** Use `tests/` directory for integration tests that test the public API.
-- **Never Run The Suite From Git:** Do not run `cargo test`, `make test` or `make check-pr` under `git rebase --exec`, `git bisect run`, or a git hook. This checkout is a linked worktree, and git exports `GIT_DIR` to every command it starts, which points the test fixtures at the real repository instead of their temporary directories. To verify a series commit by commit, clone into a throwaway directory (`git clone . /tmp/verify && cd /tmp/verify`) and run the checks there.
-
-## 6. Asynchronous Code
-
-- **Async/Await:** Use idiomatic `async`/`await` patterns. Be mindful of blocking operations in async contexts; use `tokio::task::spawn_blocking` if necessary.
-
-## 7. Spawning Git
-
-- **One Constructor:** Never write `Command::new("git")`. Build every git invocation with `git_cmd::in_dir`, `git_cmd::in_dir_async`, or `git_cmd::detached_async` for the rare command that names every path it touches. A test in `src/git_cmd.rs` fails the build if a raw constructor appears anywhere else in `src/`.
-- **Why:** Git reads `GIT_DIR`, `GIT_WORK_TREE` and their relatives before it looks at the working directory, so a command that appears anchored by `current_dir` is silently redirected when those variables are inherited. The constructors remove them.
+- **Toolchain:** Target stable Rust (edition 2024); do not use unstable/nightly features.
+- **Safety & Error Handling:** Prioritize safe Rust; document the safety invariant on any `unsafe` block. Use `Result<T, E>` and `?` for recoverable errors. Avoid `.unwrap()` and `.expect()` in production code unless statically proven infallible (and documented why).
+- **Type-Driven State:** Never rely on raw text/string values to represent application state. Leverage Rust's type system (`enum`s, newtypes, traits) so invalid states are unrepresentable at compile time.
+- **Complexity & Reuse (DRY):** Keep functions focused (soft limit ~50 lines, cyclomatic complexity < 15) and extract shared logic rather than duplicating code. Be mindful of blocking operations in async contexts (`tokio::task::spawn_blocking` when needed).
+- **Comments (Statements, Not Questions):** Comments must be declarative statements explaining *why* something is done or clarifying non-obvious invariants, never rhetorical questions.
+- **Never Run The Suite From Git:** Do not run `cargo test`, `make test`, or `make check-pr` under `git rebase --exec`, `git bisect run`, or a git hook. This checkout is a linked worktree, and git exports `GIT_DIR` to every command it starts, which points test fixtures at the real repository instead of their temporary directories. To verify a series commit by commit, clone into a throwaway directory (`git clone . /tmp/verify && cd /tmp/verify`) and run the checks there.
+- **Spawning Git (One Constructor):** Never write `Command::new("git")`. Build every git invocation with `git_cmd::in_dir`, `git_cmd::in_dir_async`, or `git_cmd::detached_async` (for the rare command that names every path it touches). Git reads `GIT_DIR`, `GIT_WORK_TREE`, and their relatives before looking at the working directory; the `git_cmd` constructors strip those environment variables. A test in `src/git_cmd.rs` fails the build if a raw constructor appears anywhere else in `src/`.
 
 # Project Map
 
 ## Core Application (`src/`)
-- `main.rs`: Application entry point (server).
+- `main.rs`: Application entry point (`sashiko` server daemon, `sashiko init`, `sashiko review`).
 - `bin/`: CLI and utility binaries (`sashiko-cli.rs`, `benchmark.rs`).
-- `lib.rs`: Shared library code.
-- `worker/`: Background worker implementations (Review, Security, AI).
-- `workflow/`: The core state-machine workflow engine.
-- `workflows/`: Declarative review pipelines per project (`linux_patch_review.rs`, `linux_bug.rs`, `sashiko_patch_review.rs`).
-- `toolbox/`: Tooling and capabilities for agents.
-- `ai/`: Artificial Intelligence integration logic.
-- `ingestor.rs`: Ingests patches/emails.
-- `fetcher.rs`: Fetches emails/threads (e.g., from lore.kernel.org).
-- `reviewer.rs`: Logic for reviewing patches.
-- `local_review.rs`: Logic for `sashiko-cli local` executing reviews locally.
-- `git_ops.rs`: Git operations wrapper.
-- `nntp.rs`: NNTP protocol handling.
-- `patch.rs`: Patch parsing and manipulation.
-- `forge.rs`: Webhook integration and parsing for external forges (GitHub, GitLab).
-- `email_router.rs` & `email_policy.rs`: Email routing and policy enforcement.
-- `db.rs`: Database interactions and shared wire models (`#[cfg(feature = "server")]` for `Database`).
+- `lib.rs`: Shared library root and `ReviewStatus` types.
+- `worker/`: Background workers (`bug_worker.rs`, `email.rs`, `forge.rs`, `patchwork.rs`, `compressor.rs`, `repack.rs`, `sync.rs`, `prefetch.rs`, `prompts.rs`).
+- `workflow/`: Core state-machine LLM workflow engine.
+- `workflows/`: Declarative review and bug pipelines per project (`linux_patch_review.rs`, `linux_bug.rs`, `sashiko_patch_review.rs`).
+- `toolbox/`: Agent tools for inspecting git repositories and worktrees.
+- `ai/`: LLM provider integrations, session runner, and response caching.
+- `auth.rs` & `access.rs`: Authentication (`LocalToken`, JWTs) and capability/subsystem bug access control (`Principal`, `BugAccess`).
+- `maintainers.rs`: `MAINTAINERS` file parser and subsystem/maintainer lookup index.
+- `ingestor.rs`, `fetcher.rs`, `mbox.rs`, `nntp.rs`, `patchwork.rs`, `backfill.rs`: Mailing list, Lore mbox, NNTP, and Patchwork ingestion pipelines.
+- `reviewer.rs`: Patchset review worker orchestration.
+- `local_review.rs`: Local review execution (`sashiko review`).
+- `git_cmd.rs` & `git_ops.rs`: Safe git process spawning and repository operations.
+- `patch.rs`, `baseline.rs`, `prerequisites.rs`: Patch parsing, baseline detection, and prerequisite series resolution.
+- `forge.rs`: Webhook integration and review posting for external forges (GitHub, GitLab).
+- `email_router.rs` & `email_policy.rs`: Outbound email routing and policy enforcement.
+- `db.rs` & `migrations/`: SQLite/libsql database layer (`#[cfg(feature = "server")]` for `Database`), schema migrations, and shared wire models.
 - `api.rs`: Shared HTTP protocol request/response types (unconditional).
 - `server.rs`: Axum HTTP API server handlers (`#[cfg(feature = "server")]`).
-- `settings.rs`: Application settings management.
-- `project.rs`: Target project profile selection (`linux`, `sashiko`, etc.).
-- `events.rs`: Event handling system.
-- `baseline.rs`: Baseline detection logic.
+- `settings.rs`: Application settings and ACL configuration.
+- `project.rs` & `prompt_bundle.rs`: Target project profiles (`linux`, `sashiko`, `systemd`, `iproute2`) and prompt bundle loading.
+- `events.rs`, `metrics.rs`, `logging.rs`, `compression.rs`, `utils.rs`: Internal event bus, metrics, logging, and utilities.
 
 ## Cargo Feature Profiles
 - `server` (enabled by default): Full daemon, HTTP API (`axum`), NNTP/forge ingestion, email delivery (`lettre`), SQLite/libsql persistence (`Database`), and `cache`.
 - `cache`: Local SQLite AI response caching (`ai.response_cache` / `CachingAiProvider`).
+- `bedrock` / `vertex`: Optional AWS Bedrock and Google Cloud Vertex AI provider backends.
 - `--no-default-features`: Minimal build for `sashiko` local review (`sashiko init`, `sashiko review`) and `sashiko-cli` without `libsql`, `axum`, `lettre`, or `jsonwebtoken` (`--features cache` adds the local AI response cache).
 
-## Configuration & Assets
-- `Settings.toml`: Main application configuration.
-- `email_policy.toml`: Email policy configuration.
+## Configuration, Prompts & Docs
+- `Settings.toml` & `email_policy.toml`: Main application and email policy configuration.
 - `prompts/sashiko/`: First-party review prompts, subsystem invariants, and pattern guides for reviewing Sashiko itself (`--project sashiko`).
-- `third_party/prompts/`: Markdown templates/prompts for AI reviews of upstream projects (Linux kernel, systemd, iproute).
-- `static/`: Web assets (HTML, images).
-
-## Data & External
-- `third_party/linux/`: Linux kernel source tree (reference/analysis).
-- `archives/`: Storage for mailing list archives.
-- `review_trees/`: Git worktrees used during the review process.
-
-## Documentation
+- `third_party/prompts/`: Vendored prompts for upstream projects (`kernel/`, `systemd/`, `iproute/`).
+- `static/`: Web UI assets (`static/index.html`, images).
+- `docs/`: User and operator documentation (`configuration.md`, `daemon.md`, `sashiko-cli.md`, `llm-providers.md`, `benchmarking.md`, forge setup guides).
 - `designs/`: Architecture and design documents.
-
 
 # Benchmarking
 
 **CRITICAL RULE:** Never run the full (`benchmark.json`) or small (`benchmark_small.json`) benchmarks without an explicit human request.
 
-To evaluate the AI's review performance against a set of known issues, follow this workflow:
-
-1.  **Prepare the environment:**
-    Stop any currently running sashiko processes, then move or drop the existing database to start with a clean state.
-    ```bash
-    mv sashiko.db sashiko.db.bak
-    ```
-
-2.  **Start the Server:**
-    The benchmark tool submits code for review via the REST API, so the main server must be running. In a separate terminal, start the server:
-    ```bash
-    cargo run --bin sashiko
-    ```
-
-3.  **Run the benchmark tool:**
-    Use the unified `benchmark` tool with a benchmark JSON file (e.g., `benchmark_small.json`). This tool will automatically ingest the patches via the API, wait for all AI review processes to complete in the background, and then dynamically evaluate the generated findings against ground-truth descriptions.
-    ```bash
-    cargo run --bin benchmark -- --file benchmarks/benchmark_small.json
-    ```
-
-    *   A summary of detection rates (Detected, Missed, Partially Detected) along with performance metrics (Average Tokens In/Out, Average Turns, Average Time) and counts of total concerns and findings will be printed to the console upon completion.
-    *   Detailed evaluation results are written to `benchmark_results.json` in the current working directory, which contains explanations from the AI judge for each finding.
-
-## Available Benchmark Suites
-
-When running the benchmark tool, you can select from several suites in the `benchmarks/` directory:
-
-*   **`benchmark.json`**: The complete benchmark suite (999 entries) for comprehensive testing.
-*   **`benchmark_small.json`**: A smaller representative subset (99 entries) for standard testing.
-*   **`benchmark_tiny.json`**: A very brief subset (9 entries) for quick iteration.
-*   **`benchmark_smoke.json`**: Extremely small (3 entries) smoke test.
-*   **`benchmark_preexisting.json`**: **IMPORTANT** - Used to test the Linux bug framework using known, existing Linux bugs and their original patches.
-
+See `docs/benchmarking.md` for full setup and CLI options (`cargo run --bin benchmark -- --file <path>`). Available suites in `benchmarks/`:
+- `benchmark.json` (999 entries, full suite)
+- `benchmark_small.json` (99 entries, standard suite)
+- `benchmark_tiny.json` (9 entries, quick iteration)
+- `benchmark_smoke.json` (3 entries, smoke test)
+- `benchmark_preexisting.json` (known Linux bugs for testing the pre-existing bug pipeline)
 
 # LLM Workflow Design
 
-When designing and implementing new workflows and stages in Sashiko, adhere to the following principles to ensure our code remains robust, efficient, resilient to AI hallucinations, and exceptionally clear for both the LLM and future engineers.
-
-## 1. Stage Design & Data Flow
-- **Single Responsibility:** Preferably, each stage should focus on solving a single, well-defined problem.
-- **Minimal But Sufficient Data:** Stages must receive *only* the specific information required to complete their task, but not less. **You must verify that the task is actually solvable using only the data and tools provided to the LLM.** (Rule of thumb: if a human couldn't confidently solve it with just that context, the LLM won't be able to either).
-- **Diverge & Converge (Map-Reduce):** For broad complex analyses, do not rely on one massive mega-prompt. Split the workload into specialized, parallel "expert" stages (mapping), followed by a single "Consolidation" stage (reducing) to merge, deduplicate, and verify the independent results.
-- **Negative Data Tracking:** When an LLM investigates a potential issue and determines it is *not* a bug, have it explicitly output that as a "dismissed concern." This explains *why* something isn't a problem, preventing future stages or humans from having to re-verify things the LLM already checked.
-- **Early Exits (Short-Circuiting):** Defensively bail out of workflows as soon as further processing is unnecessary (e.g., if finding arrays are empty after a stage). This saves execution time and tokens, and prevents the LLM from trying to "force" an output when there's nothing to report.
-- **Lean, Consumable Outputs:** Stages should produce minimal outputs, and those outputs should generally be consumed in full by follow-up stages in the pipeline.
-- **When to Combine Tasks:** The *only* valid reason to combine multiple tasks into a single stage is to optimize token usage and latency. If answering two or more questions requires reasoning over a highly overlapping set of context or steps, it is reasonable to group them to avoid duplicated effort.
-- **Anti-Patterns:**
-  - **The Kitchen Sink:** Throwing all available unstructured data into a stage "just in case" the LLM needs it.
-  - **Dead Outputs:** Generating intermediate fields or outputs that no subsequent stage or user actually consumes.
-
-## 2. Prompt Engineering & Schema Design
-- **Unambiguous Naming:** Every field in your input and output JSON schemas must have the best possible name to eliminate ambiguity. There must be only one single, reasonable interpretation of what a field expects.
-- **Shared Vocabulary:** Prompts must use consistent language across all stages and closely match the exact naming conventions present in the input and output schemas.
-- **The "Escape Hatch" (Avoid Rigid Classification):** Never force the LLM to choose between a fixed number of options if those options do not definitively cover all possible real-world scenarios. Always leave an escape path in your Enums or classifiers (e.g., `"Other"`, `"Unknown"`, `"Not Applicable"`). If you box an LLM into a corner, it will hallucinate an incorrect classification.
-- **Precision over Prose:** Avoid ambiguity in prompts as much as possible. Instructions must be explicit, direct, and leave no room for creative misinterpretation by the LLM.
-- **"Anti-Charity" Directives:** When analyzing code for defects, explicitly instruct the LLM not to give code "the benefit of the doubt". If a stage dismisses an issue as a false positive, it must be required to cite *concrete code* that proves it is safe, rather than assuming a surrounding system handles it perfectly.
-
-## 3. Resilient & Idiomatic Rust
-- **Type-Driven State:** Write idiomatic, robust Rust code. **Never** rely on raw text/string values to represent application state. Heavily leverage Rust's type system (e.g., `enums`, well-defined states, and traits) so that invalid states are unrepresentable and caught at compile time.
-- **Idempotency & Safe Retries:** Workflows must be designed to expect transient LLM failures (e.g., malformed JSON). Stages should be idempotent, allowing the Rust orchestrator to safely retry a failed step without duplicating external side-effects.
-- **Custom Validators & LLM Feedback:** When structural validation fails, do not just fail the pipeline. Use customized validation functions that construct specific, readable error strings to feed back into the LLM context. Tell the model *exactly* which formatting rule it violated so the retry mechanism succeeds.
-
-## 4. Observability
-- **Comprehensive Logging:** The framework must log *all* interactions with the LLM.
-- **Full Context Capture:** Every input sent to the LLM and every output string returned must be recorded in full to ensure end-to-end traceability and debugging.
-
+When designing or modifying workflows and prompts in Sashiko:
+- **Stage Design & Data Flow:** Keep each stage focused on a single problem with minimal but sufficient context (verify the task is solvable using only the data and tools provided, and avoid unused outputs). Use map-reduce (parallel expert stages followed by consolidation) for broad analyses, and short-circuit early when finding arrays are empty.
+- **Negative Data Tracking:** When an LLM investigates a candidate concern and determines it is *not* a bug, output it explicitly as a `dismissed_concern` with concrete reasoning so later stages and humans do not re-verify it.
+- **Prompt & Schema Design:** Use unambiguous field names and consistent vocabulary across prompts and JSON schemas. Always include an escape hatch in enums/classifiers (e.g., `"Other"`, `"Unknown"`, `"Not Applicable"`) so the model is never forced to hallucinate a rigid category.
+- **"Anti-Charity" Directives:** Instruct the LLM not to give code the benefit of the doubt; dismissing an issue requires citing *concrete code* proving safety rather than assuming callers or surrounding systems handle it.
+- **Idempotency & Custom Validators:** Stages must be idempotent across retries. When structural validation fails, return specific, actionable error strings telling the LLM *exactly* which rule it violated so the retry succeeds.
+- **Observability:** Log all interactions with the LLM and capture every input and output string in full for end-to-end traceability.
