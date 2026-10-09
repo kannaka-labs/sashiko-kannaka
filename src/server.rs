@@ -3584,13 +3584,18 @@ mod tests {
         assert_eq!(res_verify_allowed.status(), 200);
         let session_json: serde_json::Value = res_verify_allowed.json().await.unwrap();
         let session_token = session_json["token"].as_str().unwrap();
+        let session_claims = crate::auth::verify_token(session_token, secret).unwrap();
+        assert_eq!(
+            session_claims.exp - session_claims.iat.unwrap(),
+            SESSION_TOKEN_LIFETIME_SECONDS
+        );
 
         // 6. refresh_token for blocklisted email session -> 403 Forbidden
         let blocked_session_token = crate::auth::create_token(
             "blocked@example.com",
             secret,
             Some("session".to_string()),
-            86400,
+            SESSION_TOKEN_LIFETIME_SECONDS,
         )
         .unwrap();
 
@@ -3614,6 +3619,12 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(res_refresh_allowed.status(), 200);
+        let refreshed_json: serde_json::Value = res_refresh_allowed.json().await.unwrap();
+        let refreshed_claims =
+            crate::auth::verify_token(refreshed_json["token"].as_str().unwrap(), secret).unwrap();
+        assert!(
+            refreshed_claims.exp >= session_claims.iat.unwrap() + SESSION_TOKEN_LIFETIME_SECONDS
+        );
 
         // Sign-in link token cannot be used directly as a session API token
         let res_bearer_sign_in = client
@@ -3624,15 +3635,39 @@ mod tests {
             .unwrap();
         assert_eq!(res_bearer_sign_in.status(), 401);
 
-        // Session token whose initial issue date is older than 30 days cannot be refreshed
-        let old_iat = u64::try_from(chrono::Utc::now().timestamp())
+        // Session token whose initial issue date is 31 days old (< 1 year) can still be refreshed
+        let month_old_iat = u64::try_from(chrono::Utc::now().timestamp())
             .unwrap_or(0)
             .saturating_sub(31 * 86400);
+        let month_old_session_token = crate::auth::create_token_with_session(
+            "reviewer@example.com",
+            secret,
+            Some("session".to_string()),
+            SESSION_TOKEN_LIFETIME_SECONDS,
+            Some(month_old_iat),
+            Some("month-old-session-id".to_string()),
+        )
+        .unwrap();
+        let res_month_old_refresh = client
+            .post(format!("http://{}/api/auth/refresh", addr))
+            .header(
+                "Authorization",
+                format!("Bearer {}", month_old_session_token),
+            )
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res_month_old_refresh.status(), 200);
+
+        // Session token whose initial issue date is older than 1 year cannot be refreshed
+        let old_iat = u64::try_from(chrono::Utc::now().timestamp())
+            .unwrap_or(0)
+            .saturating_sub(366 * 86400);
         let expired_session_token = crate::auth::create_token_with_session(
             "reviewer@example.com",
             secret,
             Some("session".to_string()),
-            86400,
+            SESSION_TOKEN_LIFETIME_SECONDS,
             Some(old_iat),
             Some("old-session-id".to_string()),
         )
@@ -5368,6 +5403,9 @@ async fn request_link(
     }
 }
 
+const SESSION_TOKEN_LIFETIME_SECONDS: u64 = 30 * 24 * 3600;
+const MAX_SESSION_LIFETIME_SECONDS: u64 = 365 * 24 * 3600;
+
 async fn verify_link(
     axum::extract::State(state): axum::extract::State<Arc<AppState>>,
     axum::extract::Query(query): axum::extract::Query<VerifyLinkQuery>,
@@ -5381,14 +5419,18 @@ async fn verify_link(
         if state.settings.server.acl.is_blocklisted(&claims.sub) {
             return Err((StatusCode::FORBIDDEN, "User is blocklisted"));
         }
-        let session_token =
-            crate::auth::create_token(&claims.sub, &secret, Some("session".to_string()), 86400)
-                .map_err(|_| {
-                    (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        "Failed to create session",
-                    )
-                })?;
+        let session_token = crate::auth::create_token(
+            &claims.sub,
+            &secret,
+            Some("session".to_string()),
+            SESSION_TOKEN_LIFETIME_SECONDS,
+        )
+        .map_err(|_| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Failed to create session",
+            )
+        })?;
         Ok(Json(serde_json::json!({ "token": session_token })))
     } else {
         Err((StatusCode::NOT_IMPLEMENTED, "JWT not configured"))
@@ -5420,13 +5462,12 @@ async fn refresh_token(
                 .expect("Time went backwards")
                 .as_secs();
 
-            let max_session_lifetime = 30 * 24 * 3600; // 30 days
             if let Some(iat) = user.iat
-                && now.saturating_sub(iat) > max_session_lifetime
+                && now.saturating_sub(iat) > MAX_SESSION_LIFETIME_SECONDS
             {
                 return Err((
                     StatusCode::UNAUTHORIZED,
-                    "Session has reached maximum lifetime (30 days). Please log in again.",
+                    "Session has reached maximum lifetime (1 year). Please log in again.",
                 ));
             }
 
@@ -5434,7 +5475,7 @@ async fn refresh_token(
                 &user.email,
                 &secret,
                 Some("session".to_string()),
-                86400,
+                SESSION_TOKEN_LIFETIME_SECONDS,
                 user.iat,
                 user.sid,
             )

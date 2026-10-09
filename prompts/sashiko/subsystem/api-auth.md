@@ -234,7 +234,7 @@ when the payload changes.
 | `POST /api/webhook/{provider}` | `forge_webhook` | `read_only` + webhook secret, else local token, else `allow_all_submit` (see forge.md) |
 | `POST /api/auth/request-link` | `request_link` | rate limiter + `is_sign_in_eligible`; always answers 200 |
 | `GET /api/auth/verify` | `verify_link` | `typ == "sign_in_link"` + blocklist |
-| `POST /api/auth/refresh` | `refresh_token` | session + blocklist + 30-day `iat` cap |
+| `POST /api/auth/refresh` | `refresh_token` | session + blocklist + 1-year `iat` cap |
 | `GET /api/bug` | `get_bug` | `resolve_bug_read_principal` + `readable_bug_for_view` (capability Read by `bugid`/`slug`; `Principal` required for `id`) |
 | `GET /api/bug/enrichments` | `get_bug_enrichments` | `Principal` + `readable_bug` |
 | `GET /api/bugs` | `list_bugs` | `Principal` + `visibility()` in SQL |
@@ -288,7 +288,7 @@ records, candidate payloads) wired to `readable_bug` instead of
 
 **Token lifecycle** (`53cd80709379`, `115c1aeb2229`, `ca2feb8481e3`). HS256 is
 pinned; only `typ == "session"` is accepted as a bearer; `refresh_token`
-carries `iat` and `sid` forward and refuses past 30 days, so refreshing cannot
+carries `iat` and `sid` forward and refuses past 1 year, so refreshing cannot
 extend a session indefinitely. A sign-in link is *not* single-use — the code
 no longer claims it is. Sign-in links are withheld from the log unless
 `server.log_sign_in_links` is set, because the link is a bearer credential.
