@@ -59,11 +59,21 @@ pub fn sashiko_severity_guide() -> &'static str {
         .expect("sashiko/severity.md must exist in prompt bundle")
 }
 
+/// Returns the compiled-in content of `kannaka/severity.md` (Kannaka Labs addition).
+pub fn kannaka_severity_guide() -> &'static str {
+    PROMPT_BUNDLE_FILES
+        .iter()
+        .find(|(path, _)| *path == "kannaka/severity.md")
+        .and_then(|(_, bytes)| std::str::from_utf8(bytes).ok())
+        .expect("kannaka/severity.md must exist in prompt bundle")
+}
+
 /// Returns the compiled-in severity guide for `project`.
 pub fn severity_guide(project: ProjectId) -> &'static str {
     match project {
         ProjectId::Linux => kernel_severity_guide(),
         ProjectId::Sashiko => sashiko_severity_guide(),
+        ProjectId::Kannaka => kannaka_severity_guide(),
     }
 }
 

@@ -112,6 +112,38 @@ pub struct ClaudeCliProvider {
     pub effort: Option<String>,
 }
 
+/// Arguments for one `claude --print` completion.
+///
+/// Kannaka Labs addition: the call is isolated. Without `--tools ""`,
+/// `--strict-mcp-config` and `--setting-sources ""`, Claude Code loads the
+/// operator's settings, plugins and MCP servers and exposes its full built-in
+/// toolset to the reviewing model (measured: ~19k tokens of context, every
+/// file and memory tool on the operator's machine). A reviewer must see only
+/// the prompt Sashiko builds, which is what this provider's documentation
+/// already promised ("no tool access, no file access").
+pub fn claude_cli_args(model: &str, effort: Option<&str>) -> Vec<String> {
+    let mut args = vec![
+        "--print".to_string(),
+        "--output-format".to_string(),
+        "json".to_string(),
+        "--no-session-persistence".to_string(),
+        "--settings".to_string(),
+        r#"{"verbose":false}"#.to_string(),
+        "--tools".to_string(),
+        String::new(),
+        "--strict-mcp-config".to_string(),
+        "--setting-sources".to_string(),
+        String::new(),
+    ];
+    args.push("--model".to_string());
+    args.push(model.to_string());
+    if let Some(effort) = effort {
+        args.push("--effort".to_string());
+        args.push(effort.to_string());
+    }
+    args
+}
+
 #[async_trait]
 impl AiProvider for ClaudeCliProvider {
     async fn generate_content(&self, request: AiRequest) -> Result<AiResponse> {
@@ -119,22 +151,7 @@ impl AiProvider for ClaudeCliProvider {
 
         debug!("claude-cli prompt length: {} chars", prompt.len());
 
-        let mut args = vec![
-            "--print".to_string(),
-            "--output-format".to_string(),
-            "json".to_string(),
-            "--no-session-persistence".to_string(),
-            "--settings".to_string(),
-            r#"{"verbose":false}"#.to_string(),
-        ];
-
-        args.push("--model".to_string());
-        args.push(self.model.clone());
-
-        if let Some(effort) = &self.effort {
-            args.push("--effort".to_string());
-            args.push(effort.clone());
-        }
+        let args = claude_cli_args(&self.model, self.effort.as_deref());
 
         let mut child = Command::new("claude")
             .args(&args)
@@ -462,6 +479,23 @@ mod tests {
     use super::*;
     use crate::ai::{AiMessage, AiRequest, AiResponseFormat, AiRole, AiTool};
     use serde_json::json;
+
+    #[test]
+    fn test_cli_call_is_isolated_from_operator_tools_and_settings() {
+        // Kannaka Labs addition: without these the reviewing model gets the
+        // operator's built-in tools, MCP servers, plugins and hooks.
+        let args = claude_cli_args("sonnet", Some("high"));
+        let pos = |flag: &str| args.iter().position(|a| a == flag);
+        let tools = pos("--tools").expect("--tools present");
+        assert_eq!(args[tools + 1], "", "--tools must be given an empty list");
+        assert!(pos("--strict-mcp-config").is_some());
+        let sources = pos("--setting-sources").expect("--setting-sources present");
+        assert_eq!(args[sources + 1], "", "--setting-sources must be empty");
+        assert_eq!(args[pos("--model").unwrap() + 1], "sonnet");
+        assert_eq!(args[pos("--effort").unwrap() + 1], "high");
+        assert!(pos("--print").is_some() && pos("--no-session-persistence").is_some());
+        assert!(claude_cli_args("opus", None).iter().all(|a| a != "--effort"));
+    }
 
     #[test]
     fn test_parse_error_preview_handles_multibyte_cutoff() {

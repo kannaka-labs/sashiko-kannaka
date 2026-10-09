@@ -39,6 +39,10 @@ pub enum ProjectId {
     #[default]
     Linux,
     Sashiko,
+    /// Kannaka Labs services (Rust, TypeScript, JavaScript, Python). Reuses the
+    /// Sashiko service-review workflow engine with its own prompt set and
+    /// stage text (`workflows::kannaka_patch_review`).
+    Kannaka,
 }
 
 impl ProjectId {
@@ -48,6 +52,7 @@ impl ProjectId {
         match self {
             ProjectId::Linux => "linux",
             ProjectId::Sashiko => "sashiko",
+            ProjectId::Kannaka => "kannaka",
         }
     }
 
@@ -56,6 +61,7 @@ impl ProjectId {
         match self {
             ProjectId::Linux => "Linux",
             ProjectId::Sashiko => "Sashiko",
+            ProjectId::Kannaka => "Kannaka Labs",
         }
     }
 
@@ -70,6 +76,7 @@ impl ProjectId {
         match self {
             ProjectId::Linux => "kernel",
             ProjectId::Sashiko => "sashiko",
+            ProjectId::Kannaka => "kannaka",
         }
     }
 
@@ -80,7 +87,7 @@ impl ProjectId {
     pub fn uses_maintainers(self) -> bool {
         match self {
             ProjectId::Linux => true,
-            ProjectId::Sashiko => false,
+            ProjectId::Sashiko | ProjectId::Kannaka => false,
         }
     }
 }
@@ -98,6 +105,7 @@ impl FromStr for ProjectId {
         match s.trim().to_ascii_lowercase().as_str() {
             "linux" => Ok(ProjectId::Linux),
             "sashiko" => Ok(ProjectId::Sashiko),
+            "kannaka" => Ok(ProjectId::Kannaka),
             _ => Err(UnknownProject(s.to_string())),
         }
     }
@@ -131,7 +139,11 @@ impl ProjectId {
     /// Every project, for error messages and for tests that must cover them
     /// all. Adding a variant without adding it here fails the exhaustiveness
     /// test below.
-    pub const ALL: &'static [ProjectId] = &[ProjectId::Linux, ProjectId::Sashiko];
+    pub const ALL: &'static [ProjectId] = &[
+        ProjectId::Linux,
+        ProjectId::Sashiko,
+        ProjectId::Kannaka,
+    ];
 }
 
 #[cfg(test)]
@@ -145,10 +157,10 @@ mod tests {
         // checked against a match the compiler forces to stay exhaustive.
         for project in ProjectId::ALL {
             match project {
-                ProjectId::Linux | ProjectId::Sashiko => {}
+                ProjectId::Linux | ProjectId::Sashiko | ProjectId::Kannaka => {}
             }
         }
-        assert_eq!(ProjectId::ALL.len(), 2);
+        assert_eq!(ProjectId::ALL.len(), 3);
     }
 
     #[test]
@@ -163,6 +175,7 @@ mod tests {
     fn test_display_name() {
         assert_eq!(ProjectId::Linux.display_name(), "Linux");
         assert_eq!(ProjectId::Sashiko.display_name(), "Sashiko");
+        assert_eq!(ProjectId::Kannaka.display_name(), "Kannaka Labs");
     }
 
     #[test]
@@ -196,6 +209,7 @@ mod tests {
         // "simplification" to as_str() from silently pointing at nothing.
         assert_eq!(ProjectId::Linux.prompt_dir(), "kernel");
         assert_eq!(ProjectId::Sashiko.prompt_dir(), "sashiko");
+        assert_eq!(ProjectId::Kannaka.prompt_dir(), "kannaka");
     }
 
     #[test]

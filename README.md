@@ -1,5 +1,21 @@
 # Sashiko
 
+> **This is `sashiko-kannaka`, Kannaka Labs' fork of [Sashiko](https://github.com/sashiko-dev/sashiko).**
+> It adds a third project, `kannaka`, for reviewing Kannaka Labs codebases (Rust, TypeScript, JavaScript and
+> Python services on Linux and Windows). Everything below this note is upstream's README and applies unchanged.
+>
+> - **Use it:** `sashiko review --project kannaka <commit>` from inside a Kannaka Labs checkout, on Linux or WSL
+>   (Sashiko does not build on Windows). With `provider = "claude-cli"` it runs on a Claude Code subscription.
+> - **What is different:** a sibling workflow (`src/workflows/kannaka_patch_review.rs`) reuses the Sashiko engine,
+>   validators and schemas with Kannaka stage text and stages (`wire-contracts` and `platform` replace Sashiko's
+>   database and LLM-pipeline stages; Windows behaviour is in scope), and its own prompt set in
+>   [`prompts/kannaka/`](prompts/kannaka/README.md): review core, severity, nine cross-cutting patterns and ten
+>   component guides.
+> - **Also changed:** the `claude-cli` provider now calls the CLI with no tools, no MCP servers and no settings
+>   sources, so the reviewing model sees only the prompt (`src/ai/claude_cli.rs`).
+> - **Not yet:** the daemon's pre-existing-bug tracker has no Kannaka prompts and is refused for `--project kannaka`.
+> - **License:** Apache-2.0, as upstream. Kannaka Labs modifications are marked in the files they touch.
+
 ![Sashiko Logo](static/logo.png)
 
 [![Linux Foundation](https://img.shields.io/badge/Linux%20Foundation-Project-blue.svg)](https://www.linuxfoundation.org/)
