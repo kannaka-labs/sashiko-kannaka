@@ -7432,6 +7432,22 @@ impl Database {
         Ok(())
     }
 
+    /// Expires an active review embargo on a patchset immediately by setting
+    /// `embargo_until` to `now` while keeping it non-NULL so the background
+    /// embargo release worker still flushes held-back email, Patchwork, and
+    /// forge outbox notifications before clearing `embargo_until`.
+    pub async fn release_patchset_embargo(&self, id: i64, now: i64) -> Result<bool> {
+        let rows = self
+            .execute(
+                "UPDATE patchsets
+                 SET embargo_until = ?
+                 WHERE id = ? AND embargo_until IS NOT NULL AND embargo_until > ?",
+                libsql::params![now, id, now],
+            )
+            .await?;
+        Ok(rows > 0)
+    }
+
     pub async fn get_patchsets(
         &self,
         limit: usize,
@@ -22194,6 +22210,93 @@ mod tests {
 
         let second = cursor.next().await.unwrap();
         assert!(second.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_release_patchset_embargo() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("release_embargo.db");
+        let settings = DatabaseSettings {
+            url: db_path.to_string_lossy().to_string(),
+            token: String::new(),
+        };
+        let db = Database::new(&settings).await.unwrap();
+        db.migrate().await.unwrap();
+
+        let now = chrono::Utc::now().timestamp();
+        let thread_id = db
+            .create_thread("<embargo-test@example.com>", "Embargo test", now)
+            .await
+            .unwrap();
+        let ps_id = db
+            .create_patchset(
+                thread_id,
+                None,
+                "<embargo-test@example.com>",
+                "Embargo test",
+                "Author <author@example.com>",
+                now,
+                1,
+                1,
+                "",
+                "",
+                Some(1),
+                1,
+                None,
+                false,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        db.update_patchset_status(ps_id, "Reviewed").await.unwrap();
+        db.set_patchset_embargo_until(ps_id, now + 3600)
+            .await
+            .unwrap();
+
+        let details = db
+            .get_patchset_details(ps_id, None, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(details["status"], "Embargoed");
+
+        let summary = db
+            .get_patchset_summary(ps_id, None, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(summary["status"], "Embargoed");
+
+        // Releasing sets embargo_until = now so reads immediately see "Reviewed",
+        // while keeping embargo_until non-NULL so get_releasable_embargoed_patchsets
+        // still claims the patchset to flush held-back outboxes.
+        assert!(db.release_patchset_embargo(ps_id, now).await.unwrap());
+        assert!(!db.release_patchset_embargo(ps_id, now).await.unwrap());
+
+        let details_after = db
+            .get_patchset_details(ps_id, None, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(details_after["status"], "Reviewed");
+
+        let summary_after = db
+            .get_patchset_summary(ps_id, None, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(summary_after["status"], "Reviewed");
+
+        let releasable = db
+            .get_releasable_embargoed_patchsets(now, 10)
+            .await
+            .unwrap();
+        assert_eq!(
+            releasable.iter().map(|r| r.id).collect::<Vec<_>>(),
+            vec![ps_id]
+        );
     }
 
     fn collect_rust_sources(dir: &std::path::Path, found: &mut Vec<std::path::PathBuf>) {

@@ -80,6 +80,10 @@ impl<T: Clone> AsyncCache<T> {
         });
         Ok(value)
     }
+
+    async fn invalidate(&self) {
+        *self.inner.write().await = None;
+    }
 }
 
 struct AsyncMapCache<K, V> {
@@ -335,6 +339,10 @@ pub fn build_router(
         .route("/api/auth/refresh", post(refresh_token))
         .route("/api/auth/token", post(create_auth_token))
         .route("/api/patchset/rerun", post(rerun_patchset))
+        .route(
+            "/api/patchset/release-embargo",
+            post(release_patchset_embargo),
+        )
         .route("/api/patchset/cancel", post(cancel_patchset))
         .route("/api/patch/rerun", post(rerun_patch))
         .route("/api/bug", get(get_bug))
@@ -789,8 +797,81 @@ async fn list_messages(
     }))
 }
 
+async fn can_release_patchset_embargo(
+    state: &Arc<AppState>,
+    headers: &axum::http::HeaderMap,
+    auth: Option<&crate::auth::AuthUser>,
+    principal: &Principal,
+    patchset_id: i64,
+) -> Result<bool, StatusCode> {
+    if state.read_only {
+        return Ok(false);
+    }
+    if let Some(user) = auth {
+        if state.settings.server.acl.is_blocklisted(&user.email) {
+            return Ok(false);
+        }
+        if user
+            .sid
+            .as_deref()
+            .is_some_and(|sid| state.settings.server.acl.is_blocklisted(sid))
+        {
+            return Ok(false);
+        }
+    }
+    if is_authorized(state, headers, auth, crate::settings::Permission::Review) {
+        return Ok(true);
+    }
+    if principal.email().is_empty() && !principal.is_operator() {
+        return Ok(false);
+    }
+    let sections = state
+        .db
+        .authorizing_sections_for_patchset(patchset_id)
+        .await
+        .map_err(|e| {
+            tracing::error!("Database error resolving patchset authority: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+    let titles: Vec<SectionTitle> = sections.iter().map(|s| SectionTitle::new(s)).collect();
+    Ok(principal.may_release_embargo(&titles))
+}
+
+async fn attach_patchset_flags(
+    state: &Arc<AppState>,
+    headers: &axum::http::HeaderMap,
+    auth: Option<&crate::auth::AuthUser>,
+    principal: &Principal,
+    details: &mut serde_json::Value,
+) -> Result<(), StatusCode> {
+    let can_release = if details.get("status").and_then(|v| v.as_str()) == Some("Embargoed")
+        && let Some(ps_id) = details.get("id").and_then(|v| v.as_i64())
+    {
+        can_release_patchset_embargo(state, headers, auth, principal, ps_id).await?
+    } else {
+        false
+    };
+    if let Some(obj) = details.as_object_mut() {
+        obj.insert(
+            "smtp_enabled".to_string(),
+            serde_json::Value::Bool(state.smtp_enabled),
+        );
+        obj.insert(
+            "dry_run".to_string(),
+            serde_json::Value::Bool(state.dry_run),
+        );
+        obj.insert(
+            "can_release_embargo".to_string(),
+            serde_json::Value::Bool(can_release),
+        );
+    }
+    Ok(())
+}
+
 async fn get_patchset(
+    auth: crate::auth::OptionalAuthUser,
     OptionalPrincipal(principal): OptionalPrincipal,
+    headers: axum::http::HeaderMap,
     State(state): State<Arc<AppState>>,
     Query(query): Query<PatchQuery>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
@@ -816,16 +897,8 @@ async fn get_patchset(
 
     match result {
         Ok(Some(mut details)) => {
-            if let Some(obj) = details.as_object_mut() {
-                obj.insert(
-                    "smtp_enabled".to_string(),
-                    serde_json::Value::Bool(state.smtp_enabled),
-                );
-                obj.insert(
-                    "dry_run".to_string(),
-                    serde_json::Value::Bool(state.dry_run),
-                );
-            }
+            attach_patchset_flags(&state, &headers, auth.0.as_ref(), &principal, &mut details)
+                .await?;
             redact_embedded_bugs(&state, &principal, &mut details).await?;
             Ok(Json(details))
         }
@@ -872,6 +945,9 @@ async fn get_review(
 }
 
 async fn get_patchset_summary(
+    auth: crate::auth::OptionalAuthUser,
+    OptionalPrincipal(principal): OptionalPrincipal,
+    headers: axum::http::HeaderMap,
     State(state): State<Arc<AppState>>,
     Query(query): Query<PatchQuery>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
@@ -897,16 +973,8 @@ async fn get_patchset_summary(
 
     match result {
         Ok(Some(mut details)) => {
-            if let Some(obj) = details.as_object_mut() {
-                obj.insert(
-                    "smtp_enabled".to_string(),
-                    serde_json::Value::Bool(state.smtp_enabled),
-                );
-                obj.insert(
-                    "dry_run".to_string(),
-                    serde_json::Value::Bool(state.dry_run),
-                );
-            }
+            attach_patchset_flags(&state, &headers, auth.0.as_ref(), &principal, &mut details)
+                .await?;
             Ok(Json(details))
         }
         Ok(None) => {
@@ -1705,6 +1773,71 @@ async fn rerun_patchset(
     })?;
 
     Ok(Json(serde_json::json!({ "status": "accepted" })))
+}
+
+async fn release_patchset_embargo(
+    auth: crate::auth::OptionalAuthUser,
+    OptionalPrincipal(principal): OptionalPrincipal,
+    headers: axum::http::HeaderMap,
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<PatchQuery>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    if state.read_only {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "Server is running in read-only mode.".into(),
+        ));
+    }
+
+    let id = query
+        .id
+        .parse::<i64>()
+        .map_err(|_| (StatusCode::BAD_REQUEST, "Invalid id parameter".into()))?;
+
+    let allowed = can_release_patchset_embargo(&state, &headers, auth.0.as_ref(), &principal, id)
+        .await
+        .map_err(|status| {
+            (
+                status,
+                "Failed to verify permissions to release embargo.".into(),
+            )
+        })?;
+    if !allowed {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "You don't have permissions to release the embargo on this patchset.".into(),
+        ));
+    }
+
+    let now = chrono::Utc::now().timestamp();
+    let released = state
+        .db
+        .release_patchset_embargo(id, now)
+        .await
+        .map_err(|e| {
+            error!("Failed to release embargo on patchset {}: {}", id, e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Failed to release embargo".into(),
+            )
+        })?;
+    if released {
+        info!(
+            "Released embargo on patchset {} (actor: {})",
+            id,
+            if principal.email().is_empty() {
+                "operator/acl"
+            } else {
+                principal.email()
+            }
+        );
+        state.patchsets_homepage_cache.invalidate().await;
+    }
+
+    Ok(Json(serde_json::json!({
+        "status": "released",
+        "released": released,
+    })))
 }
 
 async fn cancel_patchset(
@@ -4735,6 +4868,268 @@ F:	net/
         );
         let resp = client.get(&health_url).send().await.unwrap();
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn test_release_patchset_embargo_authorization_and_endpoint() {
+        let mut settings = crate::settings::Settings::new().unwrap();
+        settings.database.url = ":memory:".to_string();
+        settings.server.testing_mode = false;
+        settings.server.read_only = false;
+        settings.server.acl.admins = vec!["operator@example.org".to_string()];
+        settings.server.acl.review = vec!["reviewer@example.org".to_string()];
+        settings.server.acl.blocklist = vec!["blocked@example.org".to_string()];
+        let db = Arc::new(Database::new(&settings.database).await.unwrap());
+        db.migrate().await.unwrap();
+        let settings = Arc::new(settings);
+
+        let now = chrono::Utc::now().timestamp();
+        let thread_id = db
+            .create_thread("<embargo-srv@example.com>", "[PATCH] btrfs: fix", now)
+            .await
+            .unwrap();
+        let ps_id = db
+            .create_patchset(
+                thread_id,
+                None,
+                "<embargo-srv@example.com>",
+                "[PATCH] btrfs: fix",
+                "Author <author@example.com>",
+                now,
+                1,
+                1,
+                "",
+                "",
+                Some(1),
+                1,
+                None,
+                false,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        db.update_patchset_status(ps_id, "Reviewed").await.unwrap();
+        db.set_patchset_embargo_until(ps_id, now + 3600)
+            .await
+            .unwrap();
+        db.add_patchset_maintainer_sections(
+            ps_id,
+            &[
+                crate::db::AttributedSubsystem::from_maintainers("BTRFS FILE SYSTEM"),
+                crate::db::AttributedSubsystem::from_path_prefix("fs/btrfs"),
+            ],
+        )
+        .await
+        .unwrap();
+
+        let maintainers_text = r#"
+Maintainers List
+===================
+
+BTRFS FILE SYSTEM
+M:	Chris Mason <clm@fb.com>
+R:	Josef Bacik <josef@toxicpanda.com>
+M:	Blocked Maintainer <blocked@example.org>
+S:	Maintained
+F:	fs/btrfs/
+
+NETWORKING [GENERAL]
+M:	David S. Miller <davem@davemloft.net>
+S:	Maintained
+F:	net/
+
+THE REST
+M:	Linus Torvalds <torvalds@linux-foundation.org>
+S:	Buried alive in reporters
+F:	*
+"#;
+        let index =
+            crate::maintainers::MaintainersIndex::from_reader(maintainers_text.as_bytes()).unwrap();
+        let acl = &settings.server.acl;
+
+        let (event_tx, _event_rx) = mpsc::channel(10);
+        let (fetch_tx, _fetch_rx) = mpsc::channel(10);
+        let state = Arc::new(AppState {
+            db: db.clone(),
+            sender: event_tx,
+            fetch_sender: fetch_tx,
+            settings: settings.clone(),
+            read_only: false,
+            allow_all_submit: false,
+            smtp_enabled: false,
+            dry_run: true,
+            local_token: None,
+            email_worker_heartbeat: None,
+            forge_registry: Arc::new(crate::forge::ForgeRegistry::new()),
+            patchsets_homepage_cache: AsyncCache::new(Duration::from_secs(2)),
+            messages_homepage_cache: AsyncCache::new(Duration::from_secs(2)),
+            patchsets_count_cache: AsyncCache::new(Duration::from_secs(10)),
+            messages_count_cache: AsyncCache::new(Duration::from_secs(10)),
+            stats_timeline_cache: AsyncMapCache::new(Duration::from_secs(60)),
+            stats_reviews_cache: AsyncCache::new(Duration::from_secs(60)),
+            stats_tools_cache: AsyncCache::new(Duration::from_secs(60)),
+            bug_subsystems_cache: AsyncMapCache::new(Duration::from_secs(60)),
+            sign_in_link_rate_limiter: SignInLinkRateLimiter::new(),
+        });
+
+        let headers = axum::http::HeaderMap::new();
+        let auth_for = |email: &str| {
+            crate::auth::OptionalAuthUser(Some(crate::auth::AuthUser {
+                email: email.to_string(),
+                typ: Some("session".to_string()),
+                iat: Some(now as u64),
+                sid: None,
+                max_bug_access: None,
+            }))
+        };
+        let query = || PatchQuery {
+            id: ps_id.to_string(),
+            page: None,
+            per_page: None,
+        };
+
+        // 1. Anonymous caller sees can_release_embargo = false and is rejected with 403.
+        let Json(anon_details) = get_patchset(
+            crate::auth::OptionalAuthUser(None),
+            OptionalPrincipal(Principal::anonymous()),
+            headers.clone(),
+            State(state.clone()),
+            Query(query()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(anon_details["status"], "Embargoed");
+        assert_eq!(anon_details["can_release_embargo"], false);
+
+        let err = release_patchset_embargo(
+            crate::auth::OptionalAuthUser(None),
+            OptionalPrincipal(Principal::anonymous()),
+            headers.clone(),
+            State(state.clone()),
+            Query(query()),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
+
+        // 2. Unrelated subsystem maintainer (davem) and blocklisted maintainer are denied.
+        for email in [
+            "davem@davemloft.net",
+            "stranger@example.org",
+            "blocked@example.org",
+        ] {
+            let p = Principal::resolve(email, acl, Some(&index));
+            let Json(d) = get_patchset(
+                auth_for(email),
+                OptionalPrincipal(p.clone()),
+                headers.clone(),
+                State(state.clone()),
+                Query(query()),
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                d["can_release_embargo"], false,
+                "{email} should not have can_release_embargo"
+            );
+            let err = release_patchset_embargo(
+                auth_for(email),
+                OptionalPrincipal(p),
+                headers.clone(),
+                State(state.clone()),
+                Query(query()),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(err.0, StatusCode::FORBIDDEN);
+        }
+
+        // 3. Scoped API token with Read ceiling for the subsystem maintainer is denied.
+        let clm_read = Principal::resolve("clm@fb.com", acl, Some(&index))
+            .with_max_access(Some(crate::access::BugAccess::Read));
+        let clm_api_auth = crate::auth::OptionalAuthUser(Some(crate::auth::AuthUser {
+            email: "clm@fb.com".to_string(),
+            typ: Some("api_token".to_string()),
+            iat: Some(now as u64),
+            sid: None,
+            max_bug_access: Some("read".to_string()),
+        }));
+        let err = release_patchset_embargo(
+            clm_api_auth,
+            OptionalPrincipal(clm_read),
+            headers.clone(),
+            State(state.clone()),
+            Query(query()),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
+
+        // 4. Corresponding maintainer (M:), reviewer (R:), global maintainer, operator,
+        // and ACL Permission::Review holder all see can_release_embargo = true.
+        for email in [
+            "clm@fb.com",
+            "josef@toxicpanda.com",
+            "torvalds@linux-foundation.org",
+            "operator@example.org",
+            "reviewer@example.org",
+        ] {
+            let p = Principal::resolve(email, acl, Some(&index));
+            let Json(d) = get_patchset_summary(
+                auth_for(email),
+                OptionalPrincipal(p),
+                headers.clone(),
+                State(state.clone()),
+                Query(query()),
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                d["can_release_embargo"], true,
+                "{email} should have can_release_embargo"
+            );
+        }
+
+        // 5. Corresponding maintainer releases the embargo; patchset immediately becomes Reviewed.
+        let clm = Principal::resolve("clm@fb.com", acl, Some(&index));
+        let Json(res) = release_patchset_embargo(
+            auth_for("clm@fb.com"),
+            OptionalPrincipal(clm.clone()),
+            headers.clone(),
+            State(state.clone()),
+            Query(query()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(res["status"], "released");
+        assert_eq!(res["released"], true);
+
+        // Re-releasing an already released patchset is idempotent.
+        let Json(res_again) = release_patchset_embargo(
+            auth_for("clm@fb.com"),
+            OptionalPrincipal(clm.clone()),
+            headers.clone(),
+            State(state.clone()),
+            Query(query()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(res_again["status"], "released");
+        assert_eq!(res_again["released"], false);
+
+        let Json(after_details) = get_patchset(
+            auth_for("clm@fb.com"),
+            OptionalPrincipal(clm),
+            headers,
+            State(state),
+            Query(query()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(after_details["status"], "Reviewed");
+        assert_eq!(after_details["can_release_embargo"], false);
     }
 }
 

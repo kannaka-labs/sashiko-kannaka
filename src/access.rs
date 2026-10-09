@@ -291,6 +291,12 @@ impl Principal {
         self.may_create
     }
 
+    /// Whether this principal may release a review embargo on a patchset from
+    /// the MAINTAINERS sections attributed to it.
+    pub fn may_release_embargo(&self, attributed: &[SectionTitle]) -> bool {
+        self.access_to(attributed).can_manage()
+    }
+
     /// The sections this principal maintains, spelled as MAINTAINERS spells
     /// them, for use as query parameters. Sorted so that the value is stable
     /// enough to key a cache on.
@@ -869,5 +875,55 @@ F:	*/
             none_token.access_to_with_bugid(&btrfs(), true),
             BugAccess::None
         );
+    }
+
+    #[test]
+    fn test_may_release_embargo() {
+        let idx = index();
+        let acl_cfg = acl();
+        let net = [SectionTitle::new("NETWORKING [GENERAL]")];
+
+        let anon = Principal::anonymous();
+        assert!(!anon.may_release_embargo(&btrfs()));
+        assert!(!anon.may_release_embargo(&[]));
+
+        let stranger = Principal::resolve("stranger@example.org", &acl_cfg, Some(&idx));
+        assert!(!stranger.may_release_embargo(&btrfs()));
+
+        // Security list has Comment access, not Manage, so it cannot release patchset embargoes.
+        let sec = Principal::resolve("security@example.org", &acl_cfg, Some(&idx));
+        assert!(!sec.may_release_embargo(&btrfs()));
+
+        // Subsystem maintainer (M:) can release on their own section only, unless blocklisted.
+        let davem = Principal::resolve("davem@davemloft.net", &acl_cfg, Some(&idx));
+        assert!(davem.may_release_embargo(&net));
+        assert!(!davem.may_release_embargo(&btrfs()));
+        assert!(!davem.may_release_embargo(&[]));
+
+        // clm@fb.com is in acl().blocklist, so blocklist revokes embargo release even on BTRFS.
+        let clm_blocked = Principal::resolve("clm@fb.com", &acl_cfg, Some(&idx));
+        assert!(!clm_blocked.may_release_embargo(&btrfs()));
+
+        // Without the blocklist entry, clm@fb.com can release BTRFS embargoes only.
+        let clm = Principal::resolve("clm@fb.com", &AclSettings::default(), Some(&idx));
+        assert!(clm.may_release_embargo(&btrfs()));
+        assert!(!clm.may_release_embargo(&net));
+
+        // Scoped API token with Read or Comment ceiling attenuates embargo release.
+        let clm_read = clm.clone().with_max_access(Some(BugAccess::Read));
+        assert!(!clm_read.may_release_embargo(&btrfs()));
+        let clm_comment = clm.clone().with_max_access(Some(BugAccess::Comment));
+        assert!(!clm_comment.may_release_embargo(&btrfs()));
+        let clm_manage = clm.with_max_access(Some(BugAccess::Manage));
+        assert!(clm_manage.may_release_embargo(&btrfs()));
+
+        // Global maintainer (THE REST) and operator can release even unattributed patchsets.
+        let torvalds = Principal::resolve("torvalds@linux-foundation.org", &acl_cfg, Some(&idx));
+        assert!(torvalds.may_release_embargo(&btrfs()));
+        assert!(torvalds.may_release_embargo(&[]));
+
+        let op = Principal::resolve("operator@example.org", &acl_cfg, Some(&idx));
+        assert!(op.may_release_embargo(&btrfs()));
+        assert!(op.may_release_embargo(&[]));
     }
 }
