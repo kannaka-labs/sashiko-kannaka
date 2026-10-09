@@ -79,7 +79,7 @@ send_positive_review = true
 
 [subsystems.kbuild]
 lists = ["linux-kbuild@vger.kernel.org"]
-cc = ["nathan@kernel.org", "nsc@kernel.org"]
+cc = ["linux-kbuild@vger.kernel.org", "nathan@kernel.org", "nsc@kernel.org"]
 cc_individuals = true
 embargo_hours = 24
 reply_all = true
