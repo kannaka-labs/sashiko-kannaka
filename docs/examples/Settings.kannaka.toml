@@ -1,0 +1,21 @@
+# Sashiko Kannaka: local review settings for Kannaka Labs codebases.
+# Use with: sashiko-kannaka review --settings Settings.kannaka.toml --project kannaka <commit>
+
+log_level = "warn"
+
+[project]
+# Checked against --project / SASHIKO_PROJECT; a mismatch is an error.
+kind = "kannaka"
+
+[ai]
+# Claude Code CLI: uses a Claude Code subscription, no API key. The provider
+# runs the CLI with no tools, no MCP servers and no settings sources.
+provider = "claude-cli"
+model = "sonnet"
+max_input_tokens = 190000
+max_interactions = 150
+
+[review]
+# Required by `sashiko review`.
+concurrency = 1
+timeout_seconds = 3600
