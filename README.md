@@ -1,132 +1,145 @@
-# Sashiko
+# Sashiko Kannaka
 
-> **This is `sashiko-kannaka`, Kannaka Labs' fork of [Sashiko](https://github.com/sashiko-dev/sashiko).**
-> It adds a third project, `kannaka`, for reviewing Kannaka Labs codebases (Rust, TypeScript, JavaScript and
-> Python services on Linux and Windows). Everything below this note is upstream's README and applies unchanged.
->
-> - **Use it:** `sashiko review --project kannaka <commit>` from inside a Kannaka Labs checkout, on Linux or WSL
->   (Sashiko does not build on Windows). With `provider = "claude-cli"` it runs on a Claude Code subscription.
-> - **What is different:** a sibling workflow (`src/workflows/kannaka_patch_review.rs`) reuses the Sashiko engine,
->   validators and schemas with Kannaka stage text and stages (`wire-contracts` and `platform` replace Sashiko's
->   database and LLM-pipeline stages; Windows behaviour is in scope), and its own prompt set in
->   [`prompts/kannaka/`](prompts/kannaka/README.md): review core, severity, nine cross-cutting patterns and ten
->   component guides.
-> - **Also changed:** the `claude-cli` provider now calls the CLI with no tools, no MCP servers and no settings
->   sources, so the reviewing model sees only the prompt (`src/ai/claude_cli.rs`).
-> - **Not yet:** the daemon's pre-existing-bug tracker has no Kannaka prompts and is refused for `--project kannaka`.
-> - **License:** Apache-2.0, as upstream. Kannaka Labs modifications are marked in the files they touch.
+Kannaka Labs' code reviewer: a fork of [Sashiko](https://github.com/sashiko-dev/sashiko), the agentic patch
+reviewer the Linux kernel runs on its mailing lists, equipped for the Kannaka Labs codebases.
 
-![Sashiko Logo](static/logo.png)
+Upstream Sashiko reviews kernel C with kernel prompts. This fork adds a third project, **`kannaka`**, that reviews
+Kannaka Labs services: Rust, TypeScript, JavaScript and Python programs that run on Linux servers and Windows
+desktops, talk over NATS, HTTP and each other's command-line output, and handle real money, public accounts and
+live memory stores. Everything upstream does still works unchanged (`--project linux`, `--project sashiko`).
 
-[![Linux Foundation](https://img.shields.io/badge/Linux%20Foundation-Project-blue.svg)](https://www.linuxfoundation.org/)
+Upstream's own README is kept at [docs/UPSTREAM-README.md](docs/UPSTREAM-README.md).
 
-> **Sashiko** (刺し子, literally "little stabs") is a form of decorative reinforcement stitching from Japan. Originally used to reinforce points of wear or to repair worn places or tears with patches, here it represents our mission to reinforce the Linux kernel through automated, intelligent patch review.
+## What it reviews for
 
-Sashiko is a self-contained, agentic Linux kernel code review system. It uses kernel-specific prompts and a multi-stage verification protocol to review proposed changes locally from your git checkout or automatically from mailing lists (`lore.kernel.org`) and git forges.
+The `kannaka` project ranks what a bad change costs here, in this order:
 
-- **Kernel Maintainers:** See the [Guide for Kernel Maintainers](MAINTAINERS_GUIDE.md) for configuring mailing list tracking, subsystem prompts, and email policies.
-- **Mailing List:** Join [`sashiko@lists.linux.dev`](https://lore.kernel.org/sashiko) for announcements, feedback, and discussions (automated review replies use `sashiko-reviews@lists.linux.dev`).
-- **Community & Press:** Read what kernel maintainers and the media say in [Sashiko in the Press](PRESS.md).
+1. **Being told something false.** A failure that looks like success: an empty result that was really an error,
+   a 200 with an error inside, a test that cannot fail, a measurement scored from a malformed input.
+2. **Money, credentials and public surfaces.** Value moved without a verified authorization, a secret in a log or
+   a prompt, a post or mail sent twice or without consent.
+3. **Live state.** A memory store written by two processes, a read-looking command that writes, a retry loop
+   that treats a permanent refusal as transient.
+4. **Contracts between programs.** One program changing what it prints or publishes while another still parses
+   the old shape.
 
-> [!NOTE]
-> **Other Open-Source Projects:** Sashiko is exploring covering other open-source projects beyond the Linux kernel. If you are interested in bringing Sashiko to your project, please reach out to Roman Gushchin (`roman.gushchin@linux.dev`).
+Windows behaviour is in scope. Upstream's own service prompts tell the reviewer never to report portability
+issues; the Kannaka stages do the opposite, and a test keeps it that way.
 
-## Quick Start (Local Patch Review)
+## How a review runs
 
-The easiest way to use Sashiko is `sashiko review`, which reviews commits directly in your local Linux kernel checkout without running a daemon or database.
+The same graph as upstream: pre-screen, planning, parallel analysis stages, verification, per-finding
+post-verification with repository tools, report and summary. The Kannaka analysis stages are:
 
-### 1. Install
+| Stage | When | Looks for |
+|---|---|---|
+| `goal` | always | intent, single responsibility, claims in the commit message that the diff cannot back |
+| `implementation` | always | incomplete changes at boundaries, including readers in other repositories |
+| `execution-flow` | always | silent failure, crashes on runtime input, exit codes, timeouts |
+| `concurrency` | planner | single-writer stores, locks, child processes, retry and reconnect loops |
+| `wire-contracts` | planner | NATS subjects and ACLs, HTTP status and shape, JSON and binary output contracts |
+| `platform` | planner | Windows and Linux differences: socket handles, paths, `~`, CRLF, BOM, signals, shims |
+| `security` | planner | secrets, money, live stores, untrusted input, prompt injection |
+| `interfaces-compat` | planner | CLI flags and `--help`, configuration, public surfaces |
+| `tests` | planner | tests that cannot fail, hand-written fixtures, shared test state |
 
-Requires **Rust 1.90+**, **Git**, and an **LLM Provider API Key**.
+Verification keeps upstream's proof bar: a finding needs concrete code evidence, a dismissal needs it too, and
+anything contested goes to tool-assisted post-verification.
+
+## The prompt set
+
+[`prompts/kannaka/`](prompts/kannaka/README.md), compiled into the binary:
+
+- `review-core.md`, `severity.md`, `false-positive-guide.md`, `prompt-injection.md`, `github-summary-template.md`
+- nine cross-cutting patterns: silent failure, error handling, concurrency, retries and refusals, wire contracts,
+  Windows and Linux, secrets and money, public surfaces, tests that can fail
+- ten component guides, each written from the repository's default branch and anchored to real symbols:
+
+| Guide | Covers |
+|---|---|
+| `km-nats.md`, `km-store.md`, `km-cli.md`, `km-ci-release.md` | kannaka-memory: NATS transport and refusals, the HRM store, the `kannaka` CLI contract, CI and release |
+| `radio.md` | kannaka-radio server |
+| `node-http-services.md` | kannaka-observatory, kannaka-eye, kannaka-staff |
+| `kannaktopus.md` | Kannaktopus MCP server, scripts and hooks |
+| `kax-ledger.md` | Agent-Kax credit ledger, offers and escrow |
+| `gsr-store.md` | the USDC record store and its gasless relayer |
+| `kshb-harness.md` | the KSHB research harness |
+
+The pre-screen stage picks guides from [`subsystem/subsystem.md`](prompts/kannaka/subsystem/subsystem.md) by path
+and symbol. When code changes, the guide that describes it should change in the same pull request.
+
+Writing these guides found real defects, all fixed since: a rate limit keyed on a header the caller controls and
+a claimable anonymous purchase in the store; `--help` running `swarm join` and re-encoding a store in
+kannaka-memory; an events stream that stored nothing; tagged memories that never stored in Kannaktopus; unguarded
+admin routes on the radio; instruments that scored non-measurements in KSHB.
+
+## Running it
+
+Sashiko targets Unix and does not compile on Windows. On a Windows desktop, run it in WSL.
+
+**Build** (Rust 1.90 or newer; Ubuntu needs `pkg-config libssl-dev cmake build-essential`):
 
 ```bash
-cargo install sashiko
+git clone https://github.com/kannaka-labs/sashiko-kannaka && cd sashiko-kannaka
+git submodule deinit -f third_party/linux 2>/dev/null   # the kernel tree is only for --project linux
+CARGO_BUILD_JOBS=4 cargo build --release                 # ~16 min cold; keep jobs low on a shared desktop
+ln -sf "$PWD/target/release/sashiko" /usr/local/bin/sashiko-kannaka
 ```
 
-### 2. Configure
+**Configure** with [`docs/examples/Settings.kannaka.toml`](docs/examples/Settings.kannaka.toml): the Claude Code
+CLI provider (no API key; it uses a Claude Code subscription), `model = "sonnet"`, and the fields `sashiko review`
+requires.
 
-Initialize a configuration file (`~/.config/sashiko.toml` by default, or `./Settings.toml` in the working directory) and set your API key:
+**From WSL, reach the Windows Claude Code CLI** with [`scripts/kannaka/install-wsl-claude-bridge.sh`](scripts/kannaka/install-wsl-claude-bridge.sh).
+It installs `/usr/local/bin/claude` as a bridge to the signed-in Windows `claude.exe`.
+
+**Review a commit** from a clone inside WSL (not under `/mnt/c`, so no Windows project memory is loaded):
 
 ```bash
-sashiko init
-export LLM_API_KEY="your-api-key-here"
+cd ~/repos/kannaka-memory
+sashiko-kannaka review --settings ~/Settings.kannaka.toml --project kannaka HEAD
+sashiko-kannaka review --settings ~/Settings.kannaka.toml --project kannaka --format json HEAD~3..HEAD > review.json
 ```
 
-Gemini is used by default. For Claude, OpenAI-compatible endpoints, AWS Bedrock, Vertex AI, Claude Code CLI, GitHub Copilot CLI, Kiro CLI, Devin CLI, or goose, see the [LLM Provider Configuration Guide](docs/llm-providers.md).
+A small commit takes about 8 minutes and about 300k input tokens. Nothing is posted anywhere; local review
+uses a scratch clone and leaves the working tree alone.
 
-### 3. Review Your Patches
+## Isolation of the model
 
-Run `sashiko review` from inside your Linux kernel checkout:
+The `claude-cli` provider runs the CLI with `--tools "" --strict-mcp-config --setting-sources ""`. Without
+those flags Claude Code loads the operator's settings, plugins and MCP servers and gives the reviewing model the
+operator's whole toolset (measured: about 19,000 tokens of context, including memory tools). With them the model
+sees only the prompt Sashiko builds (about 3,000 tokens). The flags live in `claude_cli_args()` in
+`src/ai/claude_cli.rs`, with a test.
 
-```bash
-# Review the latest commit
-sashiko review
+## Status
 
-# Review a range of commits (pass --report-preexisting to also report pre-existing bugs)
-sashiko review HEAD~3..HEAD
-sashiko review --report-preexisting
-```
+- Merged and running locally. The fork has no CI yet: GitHub does not run inherited workflows on a new fork
+  until they are enabled. Verification so far: release build clean; the 15 Kannaka and project tests pass; the
+  library suite passes 988 of 989, the one failure being an upstream `git_ops` test that disagrees with the older
+  git on Ubuntu 24.04; an end-to-end review of a kannaka-memory commit.
+- **Not supported yet for `kannaka`:** the daemon's pre-existing-bug tracker. Its prompts are written for a
+  single Linux or Sashiko tree, and the daemon refuses `linux_bug.enabled` with `--project kannaka`.
+- **Evaluation** is pre-registered in kannaka-scientist (`docs/specs/2026-10-09-sashiko-trial-prereg.md`): stock
+  Sashiko as a clean baseline on nine known bugs and four controls; the Kannaka arm on those nine is reported
+  as contaminated, because the prompts were written by the person who fixed them; the real test is four weeks of
+  new kannaka-labs pull requests reviewed both ways, nothing posted, scored as defects surface.
 
-Local review uses a temporary scratch clone for patch application, leaving your working tree and git metadata untouched.
+## Code map of the fork
 
-> [!IMPORTANT]
-> **Data Privacy & API Costs:** Sashiko sends patch data and relevant surrounding files/history from your repository to your configured LLM provider. Ensure you are authorized to share this code with your chosen provider and monitor your token usage and billing, as multi-stage reviews can incur significant API costs. The Sashiko authors assume no liability for data transmission or API charges.
+| Change | Where |
+|---|---|
+| The `kannaka` project | `src/project.rs` (`ProjectId::Kannaka`, prompt dir `kannaka`) |
+| The workflow and stages | `src/workflows/kannaka_patch_review.rs` |
+| Routing | `src/workflows/mod.rs`, `src/workflows/review_map.rs`, `src/worker/prompts.rs`, `src/prompt_bundle.rs`, `src/reviewer.rs` |
+| Bug tracker refusal | `src/main.rs` (`run_daemon`); tracker arms shared in `src/workflows/linux_bug.rs`, `src/worker/bug_worker.rs` |
+| CLI isolation | `src/ai/claude_cli.rs` (`claude_cli_args`) |
+| Prompts | `prompts/kannaka/` |
 
-## How It Works & Review Quality
-
-### Review Quality
-
-In benchmarks against the last 1,000 unfiltered upstream commits with `Fixes:` tags, Sashiko (with Gemini 3.1 Pro) detected **53.6%** of bugs that had originally passed human review and been merged into mainline. Based on manual sampling, the false-positive rate is under **20%** (mostly gray-area concerns).
-
-As with any LLM-based tool, Sashiko's output is probabilistic and may vary across runs on the same input.
-
-### Multi-Stage Review Pipeline
-
-Sashiko evaluates patches through specialized parallel analysis stages followed by sequential consolidation stages, combined with per-subsystem prompts initially developed by Chris Mason ([review-prompts](https://github.com/masoncl/review-prompts)).
-
-**Analysis stages** (run in parallel; `goal`, `implementation`, and `execution-flow` always run, while the planning stage selects the rest unless overridden via `--stages`):
-
-- **`goal`** — architectural flaws, UAPI breakages, and conceptual correctness.
-- **`implementation`** — whether code matches the commit message, undocumented side-effects, and API contract violations.
-- **`execution-flow`** — logic errors, missing return checks, unhandled error paths, and off-by-one errors.
-- **`resources`** — memory leaks, use-after-free (UAF), double frees, and object lifecycles across queues, timers, and workqueues.
-- **`locking`** — concurrency issues, deadlocks, RCU rule violations, and thread-safety.
-- **`security`** — buffer overflows, OOB reads/writes, TOCTOU races, and uninitialized memory leaks.
-- **`hardware`** — register accesses, DMA mapping, memory barriers, and state machine constraints.
-
-**Consolidation stages** (run in sequence):
-
-1. **`verification`** — consolidates concerns and dismissed concerns across analysis stages,
-   emits well-justified findings and dismissals directly, and routes contested or speculative candidates to `hard_cases`.
-2. **`post-verification`** — runs parallel per-finding verification stages (`post-verification-1` .. `post-verification-10`) with repository tools to validate or disprove `hard_cases`.
-3. **`report`** — formats confirmed findings into a standard inline-commented LKML review report.
-
-## Documentation
-
-- **[Guide for Kernel Maintainers](MAINTAINERS_GUIDE.md)** — mailing list tracking, subsystem prompts, baseline detection, and email delivery options.
-- **[Sashiko in the Press](PRESS.md)** — quotes from Linux kernel maintainers on LKML and press coverage.
-- **[LLM Provider Configuration](docs/llm-providers.md)** — setup instructions for Gemini, Claude, OpenAI, Bedrock, Vertex AI, and CLI providers.
-- **[Running the Daemon (Server Mode)](docs/daemon.md)** — building from source, monitoring mailing lists (NNTP) and forges, Web UI, `sashiko-cli`, and server ACL security.
-- **[Configuration Reference](docs/configuration.md)** — complete reference for `Settings.toml`, `email_policy.toml`, Patchwork integration, and environment variables.
-- **[CLI Reference (`sashiko-cli`)](docs/sashiko-cli.md)** — submitting patches and querying status on a running Sashiko daemon.
-- **[Forge Setup Guide](docs/FORGE_SETUP.md)** *(Experimental)* — webhook integration for [GitHub](docs/GITHUB_SETUP.md), [GitLab](docs/GITLAB_SETUP.md), and [Webhook Security](docs/WEBHOOK_SECURITY.md).
-- **[Benchmarking Guide](docs/benchmarking.md)** — evaluating review accuracy against historical bugs.
-- **[Contributing Guide](CONTRIBUTING.md)** — DCO sign-off, local verification (`make check-pr`), and the Sashiko-for-Sashiko review workflow.
+Kannaka Labs changes are marked in the files they touch. To pull upstream improvements:
+`git fetch upstream && git merge upstream/main` (the fork only adds files and match arms, so conflicts are rare).
 
 ## License
 
-Copyright The Linux Foundation and its contributors. All rights reserved.
-
-The Linux Foundation has registered trademarks and uses trademarks. For a list of trademarks of The Linux Foundation, please see our [Trademark Usage page](https://www.linuxfoundation.org/trademark-usage/).
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
+Apache-2.0, as upstream. See [LICENSE](LICENSE). Sashiko is a Linux Foundation project by its authors; this
+fork is not affiliated with or endorsed by them.
