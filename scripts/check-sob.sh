@@ -16,6 +16,16 @@ echo "Checking Developer Certificate of Origin (S-O-B) in range: $RANGE"
 for commit in $(git rev-list "$RANGE" --no-merges); do
     AUTHOR_NAME=$(git log -1 --format="%an" "$commit")
     AUTHOR_EMAIL=$(git log -1 --format="%ae" "$commit")
+
+    # Kannaka Labs addition: GitHub App bots (dependabot[bot] and the like)
+    # cannot certify the DCO, and upstream's own dependency bumps arrive
+    # unsigned. Upstream's CI checks one push at a time; a fork merging
+    # upstream checks them all at once, so skip bot authors rather than
+    # rewrite upstream history.
+    if [[ "$AUTHOR_NAME" == *"[bot]" ]]; then
+        echo "Skipping bot commit $commit ($AUTHOR_NAME)"
+        continue
+    fi
     
     # We allow the SOB to match either the author's name or the author's email.
     # This handles cases where a developer might use different emails for different

@@ -2979,7 +2979,8 @@ impl Reviewer {
             _ => msg_id_clean.to_string(),
         };
 
-        let policy = EmailPolicyConfig::load(&ctx.settings.review.email_policy_path)
+        let policy = EmailPolicyConfig::load_async(&ctx.settings.review.email_policy_path)
+            .await
             .map_err(|e| anyhow::anyhow!("Failed to parse email policy: {}", e))?;
 
         let to_list: Vec<String> = msg_details
@@ -2999,6 +3000,33 @@ impl Reviewer {
 
         let patch_author = msg_details.author.unwrap_or_default();
         let patch_subject = msg_details.subject.unwrap_or_default();
+
+        let sashiko_bare = crate::email_policy::extract_bare_email(&sender_address);
+        let author_bare = crate::email_policy::extract_bare_email(&patch_author);
+        if EmailRouter::is_ignored_author(&policy, &patch_author)
+            || (!sashiko_bare.is_empty()
+                && !author_bare.is_empty()
+                && (author_bare == sashiko_bare
+                    || patch_author.to_ascii_lowercase().contains(&sashiko_bare)))
+        {
+            info!(
+                "Bot loop guard muted notifications for patch {}/{} (ID: {}) from {}",
+                patchset_id, index, patch_id, patch_author
+            );
+            ctx.db
+                .insert_email_outbox(
+                    patch_id,
+                    "Muted",
+                    "[]",
+                    "[]",
+                    "Muted",
+                    msg_id_clean,
+                    &references_hdr,
+                    "Muted by bot loop guard",
+                )
+                .await?;
+            return Ok(());
+        }
 
         let domain = if ctx.settings.project.domain.is_empty() {
             "sashiko.dev"
@@ -3075,13 +3103,13 @@ impl Reviewer {
 
         if total_issues_count == 0 {
             let mut sent_positive_review = false;
-            if let EmailAction::Send {
-                to,
-                cc,
-                send_positive_review,
-            } = &action
-                && *send_positive_review
-            {
+            if let Some((pos_to, pos_cc)) = EmailRouter::resolve_positive_recipients(
+                &policy,
+                &to_list,
+                &cc_list,
+                &patch_author,
+                &sender_address,
+            ) {
                 let mut body_head = String::new();
                 if let Some(body) = &msg_details.body {
                     let mut commit_msg_lines = Vec::new();
@@ -3130,8 +3158,10 @@ impl Reviewer {
                 }
 
                 if !body_head.is_empty() {
-                    let to_json = serde_json::to_string(&to).unwrap_or_else(|_| "[]".to_string());
-                    let cc_json = serde_json::to_string(&cc).unwrap_or_else(|_| "[]".to_string());
+                    let to_json =
+                        serde_json::to_string(&pos_to).unwrap_or_else(|_| "[]".to_string());
+                    let cc_json =
+                        serde_json::to_string(&pos_cc).unwrap_or_else(|_| "[]".to_string());
                     let subject_prefix = if patch_subject.to_lowercase().starts_with("re:") {
                         ""
                     } else {
@@ -3139,14 +3169,20 @@ impl Reviewer {
                     };
                     let final_subject = format!("{}{}", subject_prefix, patch_subject);
                     let final_body = format!(
-                        "{}\nSashiko has reviewed this patch and found no issues. It looks great!\n\n-- \nSashiko AI review · {}\n",
+                        "{}\nSashiko has reviewed this patch and found no issues.\n\n-- \nSashiko AI review · {}\n",
                         body_head, target_url
                     );
+
+                    let status = match &ctx.settings.smtp {
+                        None => "Disabled",
+                        Some(s) if s.dry_run => "Dry-Run",
+                        _ => "Pending",
+                    };
 
                     ctx.db
                         .insert_email_outbox(
                             patch_id,
-                            "Pending",
+                            status,
                             &to_json,
                             &cc_json,
                             &final_subject,
@@ -3389,7 +3425,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_prepare_baseline_applies_b4_and_based_on_prerequisites() -> Result<()> {
+    async fn test_prepare_baseline_applies_patch_id_and_series_prerequisites() -> Result<()> {
         let temp_dir = tempdir()?;
         let repo = temp_dir.path().join("repo");
         std::fs::create_dir_all(&repo)?;
@@ -3498,9 +3534,15 @@ mod tests {
         for metadata in [
             prerequisite_metadata.clone(),
             "Based-on: prerequisite@example.com".to_string(),
+            "prerequisite-message-id: prerequisite@example.com".to_string(),
+            "prerequisite-message-id: prerequisite@example.com\nBased-on: target@example.com"
+                .to_string(),
             format!("{prerequisite_metadata}\nBased-on: prerequisite@example.com"),
             format!("{prerequisite_metadata}\nBased-on: target@example.com"),
             format!("{prerequisite_metadata}\nBased-on: malformed"),
+            format!(
+                "{prerequisite_metadata}\nprerequisite-message-id: target@example.com\nBased-on: target@example.com"
+            ),
         ] {
             let (found, patch_commits, logs) = Reviewer::prepare_baseline_worktree(
                 &ctx,
@@ -4660,7 +4702,7 @@ echo '{"patchset_id": 1, "patches": [{"index": 1, "status": "applied"}]}'
             r#"
             [defaults]
             mute_all = false
-            reply_all = true
+            reply_to = ["author", "list", "recipients"]
             "#,
         )?;
 
@@ -4984,7 +5026,7 @@ inline review content 4\n\n-- \nSashiko AI review · https://sashiko.dev/#/patch
             r#"
             [defaults]
             mute_all = false
-            reply_all = true
+            reply_to = ["author", "list", "recipients"]
             "#,
         )?;
 
@@ -5117,6 +5159,132 @@ inline review content 4\n\n-- \nSashiko AI review · https://sashiko.dev/#/patch
         let references_hdr: String = row.get(1)?;
         assert_eq!(in_reply_to, "msg_id_p2");
         assert_eq!(references_hdr, "msg_id_1 msg_id_p2");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_queue_notifications_positive_review_author() -> Result<()> {
+        let temp_dir = tempdir()?;
+        let policy_path = temp_dir.path().join("mailing_lists.toml");
+        std::fs::write(
+            &policy_path,
+            r#"
+            [defaults]
+            mute_all = false
+            reply_to = ["author", "list", "recipients"]
+            positive_review = "author"
+            cc = ["maintainer@example.com"]
+            "#,
+        )?;
+
+        let mut settings = Settings::new()?;
+        settings.database.url = ":memory:".to_string();
+        settings.review.email_policy_path = policy_path.to_str().unwrap().to_string();
+        settings.smtp = Some(crate::settings::SmtpSettings {
+            server: "localhost".to_string(),
+            port: 25,
+            username: None,
+            password: None,
+            sender_address: "bot@sashiko.dev".to_string(),
+            reply_to: None,
+            dry_run: false,
+        });
+
+        let db = Arc::new(Database::new(&settings.database).await?);
+        db.migrate().await?;
+
+        let thread_id = db.create_thread("msg_pos_root", "Subject", 1000).await?;
+
+        // Case 1: Clean patch (0 issues) from external author -> sends positive review
+        // only to the author, with empty Cc.
+        db.create_message(
+            "msg_pos_1",
+            thread_id,
+            None,
+            "Author <author@example.com>",
+            "[PATCH] clean patch",
+            1000,
+            "Commit body\n\nSigned-off-by: Author <author@example.com>\n---\ndiff",
+            "netdev@vger.kernel.org",
+            "reviewer@example.com",
+            None,
+            None,
+        )
+        .await?;
+
+        let ps_id = db
+            .create_patchset(
+                thread_id,
+                None,
+                "msg_pos_root",
+                "[PATCH] clean patch",
+                "Author <author@example.com>",
+                1000,
+                1,
+                1,
+                "",
+                "",
+                None,
+                1,
+                None,
+                false,
+                None,
+                None,
+            )
+            .await?
+            .unwrap();
+
+        let p_id_1 = db.create_patch(ps_id, "msg_pos_1", 1, "diff").await?;
+
+        let ctx = ReviewContext {
+            semaphore: Arc::new(Semaphore::new(1)),
+            llm_semaphore: Arc::new(Semaphore::new(56)),
+            db: db.clone(),
+            settings,
+            baseline_registry: Arc::new(
+                crate::baseline::BaselineRegistry::new(Path::new("."), None).unwrap(),
+            ),
+            quota_manager: Arc::new(QuotaManager::new()),
+            target_review_count: 1,
+            provider: Arc::new(MockProvider),
+        };
+
+        let empty_findings = Vec::new();
+        Reviewer::queue_notifications(
+            &ctx,
+            ps_id,
+            None,
+            p_id_1,
+            "msg_pos_1",
+            "msg_pos_root",
+            1,
+            "",
+            Some(&empty_findings),
+            "No issues found",
+        )
+        .await?;
+
+        let mut rows = db
+            .conn
+            .query(
+                "SELECT status, to_addresses, cc_addresses, body FROM email_outbox WHERE patch_id = ?",
+                libsql::params![p_id_1],
+            )
+            .await?;
+        let row = rows.next().await?.expect("Expected email in outbox");
+        let status: String = row.get(0)?;
+        let to_addrs: String = row.get(1)?;
+        let cc_addrs: String = row.get(2)?;
+        let body: String = row.get(3)?;
+        assert_eq!(status, "Pending");
+        assert_eq!(
+            serde_json::from_str::<Vec<String>>(&to_addrs)?,
+            vec!["Author <author@example.com>".to_string()]
+        );
+        assert!(serde_json::from_str::<Vec<String>>(&cc_addrs)?.is_empty());
+        assert!(body.contains("Sashiko has reviewed this patch and found no issues.\n"));
+        assert!(!body.contains("It looks great!"));
 
         Ok(())
     }

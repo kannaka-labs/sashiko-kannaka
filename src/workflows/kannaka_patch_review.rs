@@ -35,7 +35,7 @@ use crate::workflows::linux_patch_review::{
     append_stage_items_with_prompts, apply_post_verification_stage_output,
     apply_verification_stage_output, batch_hard_cases_by_severity, collect_stage_prompts,
     extra_prompt_paths_for_items, extra_prompt_paths_for_state, format_post_verification_feedback,
-    format_verification_stage_feedback, has_valid_proof_location, serialize_findings_for_prompt,
+    format_verification_stage_feedback, has_valid_proof_location,
     validate_post_verification_batch_items, validate_verification_stage_output,
 };
 
@@ -364,7 +364,10 @@ pub static ANALYSIS_STAGES: &[AnalysisStage] = &[
         name: "concurrency",
         short: "Concurrency & Processes",
         instruction: STAGE_CONCURRENCY_INSTRUCTION,
-        guides: &["patterns/concurrency.md", "patterns/retries-and-refusals.md"],
+        guides: &[
+            "patterns/concurrency.md",
+            "patterns/retries-and-refusals.md",
+        ],
         uses_commit_log: false,
         optional: true,
         wants_series_context: false,
@@ -1091,7 +1094,9 @@ Return strictly plain text output (no markdown, no backticks, wrapped at 78 char
             ))
             .include_file("github-summary-template.md")
             .with_var("findings", |s: &KannakaPatchReviewState| {
-                serialize_findings_for_prompt(&s.findings)
+                // Upstream 5ac3275 stopped minting per-run finding ids, so findings
+                // serialize as they are, as linux_patch_review now does.
+                serde_json::to_string_pretty(&s.findings).unwrap_or_default()
             }),
         )
         .output_format(OutputFormat::text_with_validator(
@@ -1217,15 +1222,28 @@ mod tests {
 
     #[test]
     fn test_kannaka_stage_guides_exist_in_the_prompt_tree() {
-        // A guide named in the stage table but missing from prompts/kannaka is
+        // A guide named in the stage table but missing from projects/kannaka/prompts is
         // silently never loaded, so the reviewer runs without it.
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("prompts/kannaka");
+        let root =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("projects/kannaka/prompts");
         for s in ANALYSIS_STAGES {
             for g in s.guides {
-                assert!(root.join(g).is_file(), "stage {} names missing guide {}", s.name, g);
+                assert!(
+                    root.join(g).is_file(),
+                    "stage {} names missing guide {}",
+                    s.name,
+                    g
+                );
             }
         }
-        for f in ["review-core.md", "subsystem/subsystem.md", "severity.md", "false-positive-guide.md", "github-summary-template.md", "prompt-injection.md"] {
+        for f in [
+            "review-core.md",
+            "subsystem/subsystem.md",
+            "severity.md",
+            "false-positive-guide.md",
+            "github-summary-template.md",
+            "prompt-injection.md",
+        ] {
             assert!(root.join(f).is_file(), "missing {f}");
         }
     }
@@ -1237,8 +1255,16 @@ mod tests {
         // survive into any Kannaka stage text.
         for s in ANALYSIS_STAGES {
             let t = s.instruction.to_lowercase();
-            assert!(!t.contains("never report windows"), "{} carries the Unix-only rule", s.name);
-            assert!(!t.contains("lack of windows support"), "{} carries the Unix-only rule", s.name);
+            assert!(
+                !t.contains("never report windows"),
+                "{} carries the Unix-only rule",
+                s.name
+            );
+            assert!(
+                !t.contains("lack of windows support"),
+                "{} carries the Unix-only rule",
+                s.name
+            );
         }
         let platform = analysis_stage_by_name("platform").expect("platform stage");
         assert!(platform.instruction.contains("Windows"));
@@ -1248,7 +1274,10 @@ mod tests {
     fn test_kannaka_stage_lookup_and_labels() {
         assert!(is_known_stage("wire-contracts"));
         assert!(is_known_stage("platform"));
-        assert!(!is_known_stage("persistence"), "Sashiko's DB stage is not a Kannaka stage");
+        assert!(
+            !is_known_stage("persistence"),
+            "Sashiko's DB stage is not a Kannaka stage"
+        );
         assert!(!is_known_stage("llm-pipeline"));
         assert_eq!(stage_short_label("wire-contracts"), Some("Wire Contracts"));
         assert_eq!(stage_short_label("platform"), Some("Windows & Linux"));
