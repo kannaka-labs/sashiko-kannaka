@@ -269,8 +269,10 @@ pub struct ClaudeSettings {
     pub effort: Option<String>,
 }
 
-fn default_claude_max_tokens() -> u32 {
-    4096
+/// Also the default when the `[ai.claude]` table is absent. Thinking counts
+/// toward it, so it leaves room for both the reasoning and the answer.
+pub(crate) fn default_claude_max_tokens() -> u32 {
+    32768
 }
 
 #[derive(Debug, Deserialize, Clone, Default)]
@@ -752,6 +754,17 @@ impl Default for ServerSettings {
 }
 
 impl ServerSettings {
+    /// The base URL for a link mailed to someone else, without a trailing
+    /// slash, or None unless public_base_url has a reachable host. Unlike
+    /// sign_in_base_url(), it never falls back to the bind address.
+    pub fn mailed_link_base_url(&self) -> Option<String> {
+        self.public_base_url
+            .as_deref()
+            .map(str::trim)
+            .filter(|url| is_reachable_base_url(url))
+            .map(|url| url.trim_end_matches('/').to_string())
+    }
+
     /// The base URL to build a sign-in link on, without a trailing slash.
     ///
     /// Falls back to the bind address, which is only good enough when the link
@@ -886,7 +899,7 @@ fn default_max_retries() -> u32 {
 }
 
 fn default_email_policy_path() -> String {
-    "email_policy.toml".to_string()
+    ProjectId::Linux.mailing_lists_path().to_string()
 }
 
 fn default_log_level() -> String {
@@ -1079,12 +1092,43 @@ impl Settings {
                     .to_string(),
             );
         }
+        #[cfg(feature = "server")]
+        if let Err(e) = crate::email_policy::EmailPolicyConfig::load(&self.review.email_policy_path)
+        {
+            return Err(format!(
+                "[review] email_policy_path ({}) is invalid: {}",
+                self.review.email_policy_path, e
+            ));
+        }
         Ok(())
     }
 
     /// Whether NNTP server and tracked mailing lists are configured.
     pub fn has_nntp_config(&self) -> bool {
-        !self.nntp.server.trim().is_empty() && !self.mailing_lists.track.is_empty()
+        if self.nntp.server.trim().is_empty() {
+            return false;
+        }
+        if !self.mailing_lists.track.is_empty() {
+            return true;
+        }
+        #[cfg(feature = "server")]
+        {
+            match crate::email_policy::EmailPolicyConfig::load(&self.review.email_policy_path) {
+                Ok(cfg) => !cfg.tracked_nntp_groups().is_empty(),
+                Err(e) => {
+                    tracing::error!(
+                        "Failed to parse mailing list policy {}: {}",
+                        self.review.email_policy_path,
+                        e
+                    );
+                    false
+                }
+            }
+        }
+        #[cfg(not(feature = "server"))]
+        {
+            false
+        }
     }
 }
 
@@ -1673,6 +1717,32 @@ mod tests {
     }
 
     #[test]
+    fn test_mailed_link_base_url_never_names_the_bind_address() {
+        let mut server = ServerSettings {
+            host: "::".to_string(),
+            port: 8080,
+            public_base_url: Some("https://sashiko.example.org/".to_string()),
+            read_only: false,
+            testing_mode: false,
+            jwt_secret: None,
+            log_sign_in_links: false,
+            acl: AclSettings::default(),
+        };
+        assert_eq!(
+            server.mailed_link_base_url().as_deref(),
+            Some("https://sashiko.example.org")
+        );
+        for unusable in [
+            None,
+            Some("http://[::]:8080"),
+            Some("http://localhost:8080"),
+        ] {
+            server.public_base_url = unusable.map(str::to_string);
+            assert_eq!(server.mailed_link_base_url(), None, "{:?}", unusable);
+        }
+    }
+
+    #[test]
     fn test_sign_in_link_logging_is_off_unless_asked_for() {
         // A configuration that never mentions the switch must not print
         // credentials, because that is the configuration everyone deploys.
@@ -1682,6 +1752,15 @@ mod tests {
         let opted_in: ServerSettings =
             toml::from_str("host = \"::\"\nport = 8080\nlog_sign_in_links = true").unwrap();
         assert!(opted_in.log_sign_in_links);
+    }
+
+    #[test]
+    fn test_claude_max_tokens_leaves_room_to_think() {
+        let claude: ClaudeSettings = toml::from_str("").unwrap();
+        assert_eq!(claude.max_tokens, 32768);
+
+        let capped: ClaudeSettings = toml::from_str("max_tokens = 4096").unwrap();
+        assert_eq!(capped.max_tokens, 4096);
     }
 
     #[test]

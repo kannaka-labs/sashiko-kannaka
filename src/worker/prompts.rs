@@ -53,11 +53,11 @@ impl ClassifyAiError for ReviewError {
 
 use crate::project::ProjectId;
 use crate::workflow::{WorkflowEngine, WorkflowEnv, WorkflowEvent};
-use crate::workflows::linux_patch_review::{
-    LinuxPatchReviewState, build_linux_patch_review_workflow_with_options, linux_system_prompt,
-};
 use crate::workflows::kannaka_patch_review::{
     build_kannaka_patch_review_workflow_with_options, kannaka_system_prompt,
+};
+use crate::workflows::linux_patch_review::{
+    LinuxPatchReviewState, build_linux_patch_review_workflow_with_options, linux_system_prompt,
 };
 use crate::workflows::sashiko_patch_review::{
     build_sashiko_patch_review_workflow_with_options, sashiko_system_prompt,
@@ -1745,12 +1745,7 @@ mod tests {
                 .expect("worker should succeed");
             let output = res.output.expect("worker output");
             assert_eq!(output["findings"].as_array().unwrap().len(), 1);
-            assert!(
-                output["findings"][0]["finding_id"]
-                    .as_str()
-                    .unwrap()
-                    .starts_with(&format!("{}-", project.as_str()))
-            );
+            assert_eq!(output["findings"][0]["id"], "VF1");
             assert_eq!(output["review_map"]["project"], project.as_str());
             assert_eq!(output["review_map"]["threads"].as_array().unwrap().len(), 1);
             assert_eq!(output["review_inline"], "");

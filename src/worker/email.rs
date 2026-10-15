@@ -176,15 +176,17 @@ fn build_email_message(
         .from(from.clone())
         .subject(&email_row.subject);
 
-    if email_row.kind == crate::db::EmailKind::SignInLink {
-        // Mail a person receives because they just asked for it must not
-        // provoke a vacation autoresponder, and should be filable.
+    if let Some(label) = email_row.kind.transactional_list_label() {
+        // Email addressed to a person rather than a thread must not provoke a
+        // vacation autoresponder, and should be filable. Its replies go to the
+        // sender: reply_to can be a review list, whose public archive would
+        // hold the link the reply quotes.
         builder = builder
             .header(AutoSubmitted("auto-generated".to_string()))
-            .header(ListId(format!("<sashiko-auth.{}>", from.email.domain())));
-    }
-
-    if let Some(reply_to) = &settings.reply_to {
+            .header(ListId(format!("<{}.{}>", label, from.email.domain())));
+    } else if email_row.kind == crate::db::EmailKind::ReviewNotification
+        && let Some(reply_to) = &settings.reply_to
+    {
         match reply_to.parse() {
             Ok(addr) => builder = builder.reply_to(addr),
             Err(e) => warn!("Failed to parse reply_to address '{}': {}", reply_to, e),
@@ -396,5 +398,59 @@ mod tests {
             "missing deterministic Message-ID on retry build:\n{}",
             msg2
         );
+    }
+
+    #[test]
+    fn test_transactional_email_is_marked_automated_and_filable() {
+        let settings = SmtpSettings {
+            server: "smtp.example.com".to_string(),
+            port: 587,
+            username: None,
+            password: None,
+            sender_address: "Sashiko Bot <sashiko@linux.dev>".to_string(),
+            reply_to: Some("reviews@lists.example.org".to_string()),
+            dry_run: true,
+        };
+        let row = |kind| crate::db::EmailOutboxRow {
+            id: 1,
+            patch_id: None,
+            kind,
+            status: "Sending".to_string(),
+            to_addresses: "[\"dev@example.com\"]".to_string(),
+            cc_addresses: "[]".to_string(),
+            subject: "subject".to_string(),
+            in_reply_to: String::new(),
+            references_hdr: String::new(),
+            body: "body".to_string(),
+            locked_at: Some(1000),
+            error_log: None,
+            created_at: 1000,
+        };
+        let format = |kind| {
+            String::from_utf8(
+                build_email_message(&settings, &row(kind))
+                    .unwrap()
+                    .formatted(),
+            )
+            .expect("valid utf8")
+        };
+
+        let assignment = format(crate::db::EmailKind::BugAssignment);
+        assert!(assignment.contains("Auto-Submitted: auto-generated\r\n"));
+        assert!(assignment.contains("List-Id: <sashiko-bugs.linux.dev>\r\n"));
+        assert!(!assignment.contains("Reply-To"));
+
+        let sign_in = format(crate::db::EmailKind::SignInLink);
+        assert!(sign_in.contains("List-Id: <sashiko-auth.linux.dev>\r\n"));
+        assert!(!sign_in.contains("Reply-To"));
+
+        let review = format(crate::db::EmailKind::ReviewNotification);
+        assert!(!review.contains("Auto-Submitted"));
+        assert!(!review.contains("List-Id"));
+        assert!(review.contains("Reply-To: reviews@lists.example.org\r\n"));
+
+        let unrecognized = format(crate::db::EmailKind::Unrecognized);
+        assert!(!unrecognized.contains("List-Id"));
+        assert!(!unrecognized.contains("Reply-To"));
     }
 }

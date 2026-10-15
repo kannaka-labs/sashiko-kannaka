@@ -1237,6 +1237,18 @@ pub struct ListBugsParams<'a> {
     pub visibility: BugVisibility<'a>,
 }
 
+/// A message to a person, queued inside the transaction of the change that
+/// prompts it.
+#[derive(Debug, Clone, Copy)]
+pub struct TransactionalEmail<'a> {
+    pub kind: EmailKind,
+    pub status: &'a str,
+    pub to_address: &'a str,
+    pub cc_addresses: &'a [&'a str],
+    pub subject: &'a str,
+    pub body: &'a str,
+}
+
 /// Selects bugs by who they are assigned to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AssigneeFilter<'a> {
@@ -1261,6 +1273,11 @@ pub enum EmailKind {
     ReviewNotification,
     /// A sign-in link, tied to a person.
     SignInLink,
+    /// A notice to the person a bug was just assigned to.
+    BugAssignment,
+    /// A kind written by a newer binary. Delivered with no added headers and
+    /// no Reply-To, since it may be addressed to a person.
+    Unrecognized,
 }
 
 impl EmailKind {
@@ -1268,21 +1285,33 @@ impl EmailKind {
         match self {
             EmailKind::ReviewNotification => "review_notification",
             EmailKind::SignInLink => "sign_in_link",
+            EmailKind::BugAssignment => "bug_assignment",
+            EmailKind::Unrecognized => "unrecognized",
+        }
+    }
+
+    /// The List-Id label for email sent to a person rather than to a patch's
+    /// thread, or None for review notifications.
+    pub fn transactional_list_label(self) -> Option<&'static str> {
+        match self {
+            EmailKind::ReviewNotification | EmailKind::Unrecognized => None,
+            EmailKind::SignInLink => Some("sashiko-auth"),
+            EmailKind::BugAssignment => Some("sashiko-bugs"),
         }
     }
 
     /// Reads a stored value.
     ///
-    /// A value written by a newer binary is reported as a review notification,
-    /// which is the treatment that adds no headers and grants no exemption, so
-    /// an unrecognized row is delivered plainly rather than dropped.
+    /// A value written by a newer binary is reported as Unrecognized, so the
+    /// row is delivered plainly rather than dropped.
     pub fn from_stored(value: &str) -> Self {
         match value {
             "sign_in_link" => EmailKind::SignInLink,
+            "bug_assignment" => EmailKind::BugAssignment,
             "review_notification" => EmailKind::ReviewNotification,
             other => {
-                tracing::warn!("Unrecognized email kind {:?}, treating as review", other);
-                EmailKind::ReviewNotification
+                tracing::warn!("Unrecognized email kind {:?}, delivering plainly", other);
+                EmailKind::Unrecognized
             }
         }
     }
@@ -2820,18 +2849,83 @@ impl Database {
     /// rather than a failure: it says nobody was identified as responsible for
     /// this series, and the transcript rules treat that as closed.
     pub async fn authorizing_sections_for_patchset(&self, patchset_id: i64) -> Result<Vec<String>> {
+        let mut by_id = self
+            .authorizing_sections_for_patchsets(&[patchset_id])
+            .await?;
+        Ok(by_id.remove(&patchset_id).unwrap_or_default())
+    }
+
+    /// Batch form of [`Database::authorizing_sections_for_patchset`], so that
+    /// checking embargo visibility across a page of patchsets costs one query
+    /// rather than one per patchset.
+    pub async fn authorizing_sections_for_patchsets(
+        &self,
+        patchset_ids: &[i64],
+    ) -> Result<std::collections::HashMap<i64, Vec<String>>> {
+        let mut sections: std::collections::HashMap<i64, Vec<String>> =
+            std::collections::HashMap::new();
+        if patchset_ids.is_empty() {
+            return Ok(sections);
+        }
+        let placeholders = vec!["?"; patchset_ids.len()].join(", ");
         let sql = format!(
-            "SELECT subsystem FROM patchset_maintainer_sections
-             WHERE source = '{}' AND patchset_id = ?
+            "SELECT patchset_id, subsystem FROM patchset_maintainer_sections
+             WHERE source = '{}' AND patchset_id IN ({})
              ORDER BY subsystem ASC",
-            SubsystemSource::MaintainersSection.as_str()
+            SubsystemSource::MaintainersSection.as_str(),
+            placeholders
         );
-        let mut rows = self.conn.query(&sql, libsql::params![patchset_id]).await?;
-        let mut sections = Vec::new();
+        let params: Vec<libsql::Value> = patchset_ids
+            .iter()
+            .map(|&id| libsql::Value::Integer(id))
+            .collect();
+        let mut rows = self.conn.query(&sql, params).await?;
         while let Some(row) = rows.next().await? {
-            sections.push(row.get(0)?);
+            let patchset_id: i64 = row.get(0)?;
+            let subsystem: String = row.get(1)?;
+            sections.entry(patchset_id).or_default().push(subsystem);
         }
         Ok(sections)
+    }
+
+    /// Batch-queries non-preexisting finding counts `(low, medium, high, critical)`
+    /// for the given patchset IDs. Used by `/api/patchsets` to populate finding
+    /// counts on embargoed rows when the caller is an authorized maintainer.
+    pub async fn get_patchset_finding_counts(
+        &self,
+        patchset_ids: &[i64],
+    ) -> Result<std::collections::HashMap<i64, (i64, i64, i64, i64)>> {
+        let mut counts = std::collections::HashMap::new();
+        if patchset_ids.is_empty() {
+            return Ok(counts);
+        }
+        let placeholders = vec!["?"; patchset_ids.len()].join(", ");
+        let sql = format!(
+            "SELECT r.patchset_id,
+                COALESCE(SUM(CASE WHEN f.severity = 1 AND COALESCE(f.preexisting, 0) = 0 THEN 1 ELSE 0 END), 0),
+                COALESCE(SUM(CASE WHEN f.severity = 2 AND COALESCE(f.preexisting, 0) = 0 THEN 1 ELSE 0 END), 0),
+                COALESCE(SUM(CASE WHEN f.severity = 3 AND COALESCE(f.preexisting, 0) = 0 THEN 1 ELSE 0 END), 0),
+                COALESCE(SUM(CASE WHEN f.severity = 4 AND COALESCE(f.preexisting, 0) = 0 THEN 1 ELSE 0 END), 0)
+             FROM reviews r
+             JOIN findings f ON r.id = f.review_id
+             WHERE r.status = 'Reviewed' AND r.patchset_id IN ({})
+             GROUP BY r.patchset_id",
+            placeholders
+        );
+        let params: Vec<libsql::Value> = patchset_ids
+            .iter()
+            .map(|&id| libsql::Value::Integer(id))
+            .collect();
+        let mut rows = self.conn.query(&sql, params).await?;
+        while let Some(row) = rows.next().await? {
+            let patchset_id: i64 = row.get(0)?;
+            let low: i64 = row.get(1)?;
+            let medium: i64 = row.get(2)?;
+            let high: i64 = row.get(3)?;
+            let critical: i64 = row.get(4)?;
+            counts.insert(patchset_id, (low, medium, high, critical));
+        }
+        Ok(counts)
     }
 
     /// Every section attributed to a patchset, with its provenance, for
@@ -3341,18 +3435,38 @@ impl Database {
     ///
     /// Returns false when no such bug exists, so the caller can tell a bad id
     /// apart from a successful assignment.
+    ///
+    /// `notice` is queued in the same transaction, so it commits with the
+    /// assignment or not at all, unless the assignee read under the write lock
+    /// is already the new one, ignoring ASCII case.
     pub async fn assign_bug(
         &self,
         id: i64,
         assignee: Option<&str>,
         reason: Option<&str>,
+        notice: Option<&TransactionalEmail<'_>>,
     ) -> Result<bool> {
         let assignee = assignee.map(str::trim).filter(|s| !s.is_empty());
         let now = chrono::Utc::now().timestamp();
         let tx = self.begin_transaction().await?;
-        let updated = tx
-            .execute(
-                "UPDATE bugs
+        let found = {
+            let mut rows = tx
+                .query(
+                    "SELECT assignee FROM bugs WHERE id = ?1",
+                    libsql::params![id],
+                )
+                .await?;
+            match rows.next().await? {
+                Some(row) => Some(row.get::<Option<String>>(0)?),
+                None => None,
+            }
+        };
+        let Some(previous) = found else {
+            tx.rollback().await?;
+            return Ok(false);
+        };
+        tx.execute(
+            "UPDATE bugs
                     SET assignee = ?1,
                         assigned_at = CASE WHEN ?1 IS NULL THEN NULL ELSE ?2 END,
                         updated_at = ?2,
@@ -3360,24 +3474,33 @@ impl Database {
                         audit_tool = ?4,
                         audit_model = ?5
                   WHERE id = ?6",
-                libsql::params![
-                    assignee,
-                    now,
-                    self.bug_actor.as_str(),
-                    self.bug_tool.as_str(),
-                    self.bug_model.clone(),
-                    id,
-                ],
-            )
-            .await?;
-        if updated == 0 {
-            tx.rollback().await?;
-            return Ok(false);
-        }
+            libsql::params![
+                assignee,
+                now,
+                self.bug_actor.as_str(),
+                self.bug_tool.as_str(),
+                self.bug_model.clone(),
+                id,
+            ],
+        )
+        .await?;
         if let Some(reason) = reason.map(str::trim).filter(|s| !s.is_empty()) {
             tx.execute(
                 "INSERT INTO bug_enrichments (bug_id, kind, tool, author, model, created_at, content) VALUES (?, 'comment', ?, ?, ?, ?, ?)",
                 libsql::params![id, self.bug_tool.as_str(), self.bug_actor.as_str(), self.bug_model.clone(), now, reason],
+            )
+            .await?;
+        }
+        let repeat = previous
+            .as_deref()
+            .zip(assignee)
+            .is_some_and(|(previous, assignee)| previous.eq_ignore_ascii_case(assignee));
+        if let Some(notice) = notice
+            && !repeat
+        {
+            tx.execute(
+                INSERT_TRANSACTIONAL_EMAIL,
+                transactional_email_params(notice)?,
             )
             .await?;
         }
@@ -7697,6 +7820,151 @@ impl Database {
         }
     }
 
+    async fn get_baseline_json(
+        &self,
+        baseline_id: Option<i64>,
+    ) -> Result<Option<serde_json::Value>> {
+        let Some(bid) = baseline_id else {
+            return Ok(None);
+        };
+        let mut browse = self
+            .conn
+            .query(
+                "SELECT repo_url, branch, last_known_commit FROM baselines WHERE id = ?",
+                libsql::params![bid],
+            )
+            .await?;
+        if let Some(brow) = browse.next().await? {
+            Ok(Some(serde_json::json!({
+                "repo_url": brow.get::<Option<String>>(0)?,
+                "branch": brow.get::<Option<String>>(1)?,
+                "commit": brow.get::<Option<String>>(2)?,
+            })))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Loads serialized review records for an embargoed patchset and its
+    /// requested page of patches directly from SQLite when an authenticated
+    /// maintainer is authorized to view embargoed results.
+    pub async fn get_embargoed_patchset_reviews(
+        &self,
+        patchset_id: i64,
+        page: Option<u32>,
+        limit: Option<u32>,
+        include_logs: bool,
+    ) -> Result<Vec<serde_json::Value>> {
+        let mut ps_rows = self
+            .conn
+            .query(
+                "SELECT model_name, prompts_git_hash, baseline_id, provider
+                 FROM patchsets WHERE id = ?",
+                libsql::params![patchset_id],
+            )
+            .await?;
+        let Some(ps_row) = ps_rows.next().await? else {
+            return Ok(Vec::new());
+        };
+        let model_name: Option<String> = ps_row.get(0)?;
+        let prompts_git_hash: Option<String> = ps_row.get(1)?;
+        let baseline_id: Option<i64> = ps_row.get(2)?;
+        let provider: Option<String> = ps_row.get(3)?;
+        let baseline = self.get_baseline_json(baseline_id).await?;
+
+        let limit_val = limit.unwrap_or(50);
+        let page_val = page.unwrap_or(1);
+        let offset_val = limit_val.saturating_mul(page_val.saturating_sub(1));
+        let mut patch_ids = Vec::new();
+        let mut patch_rows = self
+            .conn
+            .query(
+                "SELECT id FROM patches
+                 WHERE patchset_id = ?
+                 ORDER BY part_index ASC
+                 LIMIT ? OFFSET ?",
+                libsql::params![patchset_id, limit_val, offset_val],
+            )
+            .await?;
+        while let Some(p) = patch_rows.next().await? {
+            patch_ids.push(p.get::<i64>(0)?);
+        }
+
+        self.get_patchset_reviews_for_patches(
+            patchset_id,
+            &patch_ids,
+            model_name.as_deref(),
+            provider.as_deref(),
+            prompts_git_hash.as_deref(),
+            baseline.as_ref(),
+            include_logs,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn get_patchset_reviews_for_patches(
+        &self,
+        patchset_id: i64,
+        patch_ids: &[i64],
+        model_name: Option<&str>,
+        provider: Option<&str>,
+        prompts_git_hash: Option<&str>,
+        baseline: Option<&serde_json::Value>,
+        include_logs: bool,
+    ) -> Result<Vec<serde_json::Value>> {
+        let mut reviews = Vec::new();
+        let mut in_clause = patch_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        if in_clause.is_empty() {
+            in_clause = "-1".to_string();
+        }
+        let logs_col = if include_logs { "r.logs" } else { "NULL" };
+        let query_str = format!(
+            "SELECT r.summary, r.created_at, ai.output_raw,
+                    r.result_description, r.status, r.inline_review, {},
+                    ai.tokens_in, ai.tokens_out, r.patch_id, r.id, ai.tokens_cached
+             FROM reviews r
+             LEFT JOIN ai_interactions ai ON r.interaction_id = ai.id
+             WHERE r.patchset_id = ? AND (r.patch_id IS NULL OR r.patch_id IN ({}))
+             ORDER BY r.created_at ASC",
+            logs_col, in_clause
+        );
+
+        let mut params = vec![libsql::Value::Integer(patchset_id)];
+        for &pid_val in patch_ids {
+            params.push(libsql::Value::Integer(pid_val));
+        }
+
+        let mut rev_rows = self.conn.query(&query_str, params).await?;
+        while let Some(r) = rev_rows.next().await? {
+            let mut item = serde_json::json!({
+                "summary": r.get::<Option<String>>(0)?,
+                "created_at": r.get::<Option<i64>>(1)?,
+                "output": crate::compression::get_compressed_string_opt(&r, 2)?,
+                "result": r.get::<Option<String>>(3)?,
+                "status": r.get::<Option<String>>(4)?,
+                "inline_review": crate::compression::get_compressed_string_opt(&r, 5)?,
+                "tokens_in": r.get::<Option<u32>>(7)?,
+                "tokens_out": r.get::<Option<u32>>(8)?,
+                "patch_id": r.get::<Option<i64>>(9)?,
+                "id": r.get::<i64>(10)?,
+                "tokens_cached": r.get::<Option<u32>>(11)?,
+                "model": model_name,
+                "provider": provider,
+                "prompts_hash": prompts_git_hash,
+                "baseline": baseline,
+            });
+            if include_logs && let Some(obj) = item.as_object_mut() {
+                obj.insert(
+                    "logs".to_string(),
+                    serde_json::json!(crate::compression::get_compressed_string_opt(&r, 6)?),
+                );
+            }
+            reviews.push(item);
+        }
+        Ok(reviews)
+    }
+
     pub async fn get_patchset_details(
         &self,
         id: i64,
@@ -7739,32 +8007,12 @@ impl Database {
             let embargo_until: Option<i64> = row.get(17).ok();
             let mr_url: Option<String> = row.get(18).ok();
             let slug: Option<String> = row.get(19).ok();
-            // Fetch baseline details if needed
-            let baseline = if let Some(bid) = baseline_id {
-                let mut browse = self
-                    .conn
-                    .query(
-                        "SELECT repo_url, branch, last_known_commit FROM baselines WHERE id = ?",
-                        libsql::params![bid],
-                    )
-                    .await?;
-                if let Ok(Some(brow)) = browse.next().await {
-                    Some(serde_json::json!({
-                       "repo_url": brow.get::<Option<String>>(0).ok(),
-                       "branch": brow.get::<Option<String>>(1).ok(),
-                       "commit": brow.get::<Option<String>>(2).ok(),
-                    }))
-                } else {
-                    None
-                }
-            } else {
-                None
-            };
+            let baseline = self.get_baseline_json(baseline_id).await?;
 
             // Calculate pagination
             let limit_val = limit.unwrap_or(50);
             let page_val = page.unwrap_or(1);
-            let offset_val = limit_val * (page_val.saturating_sub(1));
+            let offset_val = limit_val.saturating_mul(page_val.saturating_sub(1));
 
             // Fetch subsystems
             let mut subsystems = Vec::new();
@@ -7842,47 +8090,25 @@ impl Database {
                 }));
             }
 
-            // Fetch reviews
-            let mut reviews = Vec::new();
-            let mut in_clause = patch_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
-            if in_clause.is_empty() {
-                in_clause = "-1".to_string(); // Fallback so SQL doesn't error
-            }
-            let query_str = format!(
-                "SELECT r.summary, r.created_at, ai.input_context, ai.output_raw, 
-                        r.result_description, r.status, r.inline_review, r.logs, ai.tokens_in, ai.tokens_out, r.patch_id, r.id, ai.tokens_cached
-                 FROM reviews r
-                 LEFT JOIN ai_interactions ai ON r.interaction_id = ai.id
-                 WHERE r.patchset_id = ? AND (r.patch_id IS NULL OR r.patch_id IN ({}))
-                 ORDER BY r.created_at ASC", in_clause);
-
-            let mut params = vec![libsql::Value::Integer(pid)];
-            for &pid_val in &patch_ids {
-                params.push(libsql::Value::Integer(pid_val));
+            let mut final_status = status;
+            if is_embargoed && final_status.as_deref() == Some("Reviewed") {
+                final_status = Some("Embargoed".to_string());
             }
 
-            let mut rev_rows = self.conn.query(&query_str, params).await?;
-
-            while let Ok(Some(r)) = rev_rows.next().await {
-                reviews.push(serde_json::json!({
-                    "summary": r.get::<Option<String>>(0).ok(),
-                    "created_at": r.get::<Option<i64>>(1).ok(),
-                    "output": crate::compression::get_compressed_string_opt(&r, 3).unwrap_or(None),
-                    "result": r.get::<Option<String>>(4).ok(),
-                    "status": r.get::<Option<String>>(5).ok(),
-                    "inline_review": crate::compression::get_compressed_string_opt(&r, 6).unwrap_or(None),
-                    "logs": crate::compression::get_compressed_string_opt(&r, 7).unwrap_or(None),
-                    "tokens_in": r.get::<Option<u32>>(8).ok(),
-                    "tokens_out": r.get::<Option<u32>>(9).ok(),
-                    "patch_id": r.get::<Option<i64>>(10).ok(),
-                    "id": r.get::<i64>(11).ok(),
-                    "tokens_cached": r.get::<Option<u32>>(12).ok(),
-                    "model": model_name.clone(),
-                    "provider": provider.clone(),
-                    "prompts_hash": prompts_git_hash.clone(),
-                    "baseline": baseline.clone()
-                }));
-            }
+            let reviews = if is_embargoed {
+                Vec::new()
+            } else {
+                self.get_patchset_reviews_for_patches(
+                    pid,
+                    &patch_ids,
+                    model_name.as_deref(),
+                    provider.as_deref(),
+                    prompts_git_hash.as_deref(),
+                    baseline.as_ref(),
+                    true,
+                )
+                .await?
+            };
 
             // Fetch thread messages
             let mut messages = Vec::new();
@@ -7891,7 +8117,7 @@ impl Database {
                     "SELECT id, message_id, author, date, subject, in_reply_to FROM messages WHERE thread_id = ? AND subject != '(placeholder)' ORDER BY date ASC",
                     libsql::params![tid]
                 ).await?;
-                while let Ok(Some(m)) = msg_rows.next().await {
+                while let Some(m) = msg_rows.next().await? {
                     messages.push(serde_json::json!({
                         "id": m.get::<i64>(0)?,
                         "message_id": m.get::<String>(1)?,
@@ -7902,13 +8128,6 @@ impl Database {
                     }));
                 }
             }
-
-            let mut final_status = status;
-            if is_embargoed && final_status.as_deref() == Some("Reviewed") {
-                final_status = Some("Embargoed".to_string());
-            }
-
-            let reviews = if is_embargoed { Vec::new() } else { reviews };
 
             let bugs = self.list_bugs_for_patchset(pid).await.unwrap_or_default();
             let bugs_json = bugs
@@ -7993,30 +8212,11 @@ impl Database {
             let embargo_until: Option<i64> = row.get(17).ok();
             let mr_url: Option<String> = row.get(18).ok();
             let slug: Option<String> = row.get(19).ok();
-            let baseline = if let Some(bid) = baseline_id {
-                let mut browse = self
-                    .conn
-                    .query(
-                        "SELECT repo_url, branch, last_known_commit FROM baselines WHERE id = ?",
-                        libsql::params![bid],
-                    )
-                    .await?;
-                if let Ok(Some(brow)) = browse.next().await {
-                    Some(serde_json::json!({
-                       "repo_url": brow.get::<Option<String>>(0).ok(),
-                       "branch": brow.get::<Option<String>>(1).ok(),
-                       "commit": brow.get::<Option<String>>(2).ok(),
-                    }))
-                } else {
-                    None
-                }
-            } else {
-                None
-            };
+            let baseline = self.get_baseline_json(baseline_id).await?;
 
             let limit_val = limit.unwrap_or(50);
             let page_val = page.unwrap_or(1);
-            let offset_val = limit_val * (page_val.saturating_sub(1));
+            let offset_val = limit_val.saturating_mul(page_val.saturating_sub(1));
 
             let mut subsystems = Vec::new();
             let mut sub_rows = self
@@ -8093,45 +8293,25 @@ impl Database {
                 }));
             }
 
-            let mut reviews = Vec::new();
-            let mut in_clause = patch_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
-            if in_clause.is_empty() {
-                in_clause = "-1".to_string();
-            }
-            let query_str = format!(
-                "SELECT r.summary, r.created_at, ai.output_raw, 
-                        r.result_description, r.status, r.inline_review, ai.tokens_in, ai.tokens_out, r.patch_id, r.id, ai.tokens_cached
-                 FROM reviews r
-                 LEFT JOIN ai_interactions ai ON r.interaction_id = ai.id
-                 WHERE r.patchset_id = ? AND (r.patch_id IS NULL OR r.patch_id IN ({}))
-                 ORDER BY r.created_at ASC", in_clause);
-
-            let mut params = vec![libsql::Value::Integer(pid)];
-            for &pid_val in &patch_ids {
-                params.push(libsql::Value::Integer(pid_val));
+            let mut final_status = status;
+            if is_embargoed && final_status.as_deref() == Some("Reviewed") {
+                final_status = Some("Embargoed".to_string());
             }
 
-            let mut rev_rows = self.conn.query(&query_str, params).await?;
-
-            while let Ok(Some(r)) = rev_rows.next().await {
-                reviews.push(serde_json::json!({
-                    "summary": r.get::<Option<String>>(0).ok(),
-                    "created_at": r.get::<Option<i64>>(1).ok(),
-                    "output": crate::compression::get_compressed_string_opt(&r, 2).unwrap_or(None),
-                    "result": r.get::<Option<String>>(3).ok(),
-                    "status": r.get::<Option<String>>(4).ok(),
-                    "inline_review": crate::compression::get_compressed_string_opt(&r, 5).unwrap_or(None),
-                    "tokens_in": r.get::<Option<u32>>(6).ok(),
-                    "tokens_out": r.get::<Option<u32>>(7).ok(),
-                    "patch_id": r.get::<Option<i64>>(8).ok(),
-                    "id": r.get::<i64>(9).ok(),
-                    "tokens_cached": r.get::<Option<u32>>(10).ok(),
-                    "model": model_name.clone(),
-                    "provider": provider.clone(),
-                    "prompts_hash": prompts_git_hash.clone(),
-                    "baseline": baseline.clone()
-                }));
-            }
+            let reviews = if is_embargoed {
+                Vec::new()
+            } else {
+                self.get_patchset_reviews_for_patches(
+                    pid,
+                    &patch_ids,
+                    model_name.as_deref(),
+                    provider.as_deref(),
+                    prompts_git_hash.as_deref(),
+                    baseline.as_ref(),
+                    false,
+                )
+                .await?
+            };
 
             let mut messages = Vec::new();
             if let Some(tid) = thread_id {
@@ -8139,7 +8319,7 @@ impl Database {
                     "SELECT id, message_id, author, date, subject, in_reply_to FROM messages WHERE thread_id = ? AND subject != '(placeholder)' ORDER BY date ASC",
                     libsql::params![tid]
                 ).await?;
-                while let Ok(Some(m)) = msg_rows.next().await {
+                while let Some(m) = msg_rows.next().await? {
                     messages.push(serde_json::json!({
                         "id": m.get::<i64>(0)?,
                         "message_id": m.get::<String>(1)?,
@@ -8150,13 +8330,6 @@ impl Database {
                     }));
                 }
             }
-
-            let mut final_status = status;
-            if is_embargoed && final_status.as_deref() == Some("Reviewed") {
-                final_status = Some("Embargoed".to_string());
-            }
-
-            let reviews = if is_embargoed { Vec::new() } else { reviews };
 
             Ok(Some(serde_json::json!({
                 "id": pid,
@@ -8246,6 +8419,8 @@ impl Database {
         Ok(None)
     }
 
+    /// Fetches full details for a single review record by review ID, including
+    /// its parent `patchset_id` and `embargo_until` timestamp for embargo checks.
     pub async fn get_review_details(&self, id: i64) -> Result<Option<serde_json::Value>> {
         let mut rows = self
             .conn
@@ -8258,7 +8433,8 @@ impl Database {
                         COALESCE(
                             (SELECT m.subject FROM patches p JOIN messages m ON p.message_id = m.message_id WHERE p.id = r.patch_id LIMIT 1),
                             (SELECT ps.subject FROM patchsets ps WHERE ps.id = r.patchset_id)
-                        )
+                        ),
+                        (SELECT ps.embargo_until FROM patchsets ps WHERE ps.id = r.patchset_id)
              FROM reviews r
              LEFT JOIN ai_interactions ai ON r.interaction_id = ai.id
              LEFT JOIN baselines b ON r.baseline_id = b.id
@@ -8298,6 +8474,7 @@ impl Database {
                 "tokens_cached": r.get::<Option<u32>>(18).ok(),
                 "patchset_id": r.get::<Option<i64>>(19).ok(),
                 "subject": r.get::<Option<String>>(20).ok(),
+                "embargo_until": r.get::<Option<i64>>(21).ok(),
                 "bugs": bugs_json,
             })))
         } else {
@@ -10091,8 +10268,8 @@ impl Database {
     ///
     /// There is deliberately no dedup guard. Two sign-in requests are two
     /// distinct messages, and suppressing the second would look to the
-    /// recipient exactly like the feature being broken. Volume is bounded at
-    /// the request endpoint instead.
+    /// recipient exactly like the feature being broken. Sign-in volume is
+    /// bounded at the request endpoint instead.
     ///
     /// The caller supplies the status so that a dry-run deployment can park
     /// the row where the poller will not pick it up, which is how review mail
@@ -10103,27 +10280,46 @@ impl Database {
         kind: EmailKind,
         status: &str,
         to_address: &str,
+        cc_addresses: &[&str],
         subject: &str,
         body: &str,
     ) -> Result<()> {
-        let created_at = chrono::Utc::now().timestamp();
-        let to_json = serde_json::to_string(&[to_address])
-            .map_err(|e| libsql::Error::Misuse(e.to_string()))?;
+        let email = TransactionalEmail {
+            kind,
+            status,
+            to_address,
+            cc_addresses,
+            subject,
+            body,
+        };
         self.execute(
-                "INSERT INTO email_outbox (patch_id, kind, status, to_addresses, cc_addresses, subject, in_reply_to, references_hdr, body, created_at)
-                 VALUES (NULL, ?, ?, ?, '[]', ?, '', '', ?, ?)",
-                libsql::params![
-                    kind.as_str(),
-                    status,
-                    to_json,
-                    subject,
-                    body,
-                    created_at,
-                ],
-            )
-            .await?;
+            INSERT_TRANSACTIONAL_EMAIL,
+            transactional_email_params(&email)?,
+        )
+        .await?;
         Ok(())
     }
+}
+
+#[cfg(feature = "server")]
+const INSERT_TRANSACTIONAL_EMAIL: &str = "INSERT INTO email_outbox (patch_id, kind, status, to_addresses, cc_addresses, subject, in_reply_to, references_hdr, body, created_at)
+     VALUES (NULL, ?, ?, ?, ?, ?, '', '', ?, ?)";
+
+#[cfg(feature = "server")]
+fn transactional_email_params(email: &TransactionalEmail<'_>) -> Result<libsql::params::Params> {
+    let to_json = serde_json::to_string(&[email.to_address])
+        .map_err(|e| libsql::Error::Misuse(e.to_string()))?;
+    let cc_json = serde_json::to_string(email.cc_addresses)
+        .map_err(|e| libsql::Error::Misuse(e.to_string()))?;
+    Ok(libsql::params::Params::Positional(vec![
+        email.kind.as_str().into(),
+        email.status.into(),
+        to_json.into(),
+        cc_json.into(),
+        email.subject.into(),
+        email.body.into(),
+        chrono::Utc::now().timestamp().into(),
+    ]))
 }
 
 #[cfg(all(test, feature = "server"))]
@@ -10245,6 +10441,7 @@ mod tests {
                 EmailKind::SignInLink,
                 "Pending",
                 "maintainer@example.org",
+                &[],
                 "[sashiko] Your sign-in link",
                 "body",
             )
@@ -10258,6 +10455,7 @@ mod tests {
         assert_eq!(first.kind, EmailKind::SignInLink);
         assert_eq!(first.patch_id, None);
         assert_eq!(first.to_addresses, r#"["maintainer@example.org"]"#);
+        assert_eq!(first.cc_addresses, "[]");
         db.mark_email_sent(first.id).await?;
 
         let second = db
@@ -10273,12 +10471,32 @@ mod tests {
             EmailKind::SignInLink,
             "Dry-Run",
             "maintainer@example.org",
+            &[],
             "[sashiko] Your sign-in link",
             "body",
         )
         .await?;
         assert!(db.lock_pending_email().await?.is_none());
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_transactional_email_carries_cc() -> Result<()> {
+        let db = setup_db().await;
+        db.insert_transactional_email(
+            EmailKind::SignInLink,
+            "Pending",
+            "to@example.org",
+            &["cc@example.org"],
+            "subject",
+            "body",
+        )
+        .await?;
+
+        let email = db.lock_pending_email().await?.expect("message queued");
+        assert_eq!(email.to_addresses, r#"["to@example.org"]"#);
+        assert_eq!(email.cc_addresses, r#"["cc@example.org"]"#);
         Ok(())
     }
 
@@ -18472,7 +18690,12 @@ mod tests {
         let scoped = db.with_bug_actor("triager@example.org", "web", None);
         assert!(
             scoped
-                .assign_bug(bug_id, Some("  dev@example.org  "), Some("Owns this area"))
+                .assign_bug(
+                    bug_id,
+                    Some("  dev@example.org  "),
+                    Some("Owns this area"),
+                    None
+                )
                 .await
                 .unwrap()
         );
@@ -18493,7 +18716,7 @@ mod tests {
 
         // Reassignment is recorded as a handover rather than as two events.
         scoped
-            .assign_bug(bug_id, Some("other@example.org"), None)
+            .assign_bug(bug_id, Some("other@example.org"), None, None)
             .await
             .unwrap();
         let reassigned = db.get_bug(bug_id).await.unwrap().unwrap();
@@ -18503,13 +18726,77 @@ mod tests {
         }));
 
         // Clearing the assignee must clear the timestamp with it.
-        scoped.assign_bug(bug_id, None, None).await.unwrap();
+        scoped.assign_bug(bug_id, None, None, None).await.unwrap();
         let cleared = db.get_bug(bug_id).await.unwrap().unwrap();
         assert!(cleared.assignee.is_none());
         assert!(cleared.assigned_at.is_none());
 
         // An unknown bug reports failure instead of silently doing nothing.
-        assert!(!db.assign_bug(999_999, Some("x@y.org"), None).await.unwrap());
+        assert!(
+            !db.assign_bug(999_999, Some("x@y.org"), None, None)
+                .await
+                .unwrap()
+        );
+    }
+
+    /// The notice commits with the assignment, and only when the assignee
+    /// changes.
+    #[tokio::test]
+    async fn test_assign_bug_queues_notice_on_change_only() {
+        let db_settings = crate::settings::DatabaseSettings {
+            url: ":memory:".to_string(),
+            token: String::new(),
+        };
+        let db = Database::new(&db_settings).await.unwrap();
+        db.migrate().await.unwrap();
+        let bug_id = create_pending_bug(&db, "linux-notice").await;
+        let notice = |to| TransactionalEmail {
+            kind: EmailKind::BugAssignment,
+            status: "Pending",
+            to_address: to,
+            cc_addresses: &["lead@example.org"],
+            subject: "s",
+            body: "b",
+        };
+        let queued = || async {
+            let mut rows = db
+                .conn
+                .query(
+                    "SELECT COUNT(*) FROM email_outbox WHERE kind = 'bug_assignment'",
+                    (),
+                )
+                .await
+                .unwrap();
+            rows.next().await.unwrap().unwrap().get::<i64>(0).unwrap()
+        };
+
+        db.assign_bug(
+            bug_id,
+            Some("dev@example.org"),
+            None,
+            Some(&notice("dev@example.org")),
+        )
+        .await
+        .unwrap();
+        assert_eq!(queued().await, 1);
+        db.assign_bug(
+            bug_id,
+            Some("Dev@example.org"),
+            None,
+            Some(&notice("Dev@example.org")),
+        )
+        .await
+        .unwrap();
+        assert_eq!(queued().await, 1);
+        db.assign_bug(
+            bug_id,
+            Some("other@example.org"),
+            None,
+            Some(&notice("other@example.org")),
+        )
+        .await
+        .unwrap();
+        assert_eq!(queued().await, 2);
     }
 
     /// Filtering by assignee must be able to express both "mine" and
@@ -18526,10 +18813,10 @@ mod tests {
         let mine = create_pending_bug(&db, "linux-mine").await;
         let theirs = create_pending_bug(&db, "linux-theirs").await;
         let nobody = create_pending_bug(&db, "linux-nobody").await;
-        db.assign_bug(mine, Some("me@example.org"), None)
+        db.assign_bug(mine, Some("me@example.org"), None, None)
             .await
             .unwrap();
-        db.assign_bug(theirs, Some("them@example.org"), None)
+        db.assign_bug(theirs, Some("them@example.org"), None, None)
             .await
             .unwrap();
 

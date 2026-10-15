@@ -291,6 +291,32 @@ impl Principal {
         self.may_create
     }
 
+    /// Whether this principal may view embargoed review results on a patchset
+    /// from the MAINTAINERS sections attributed to it.
+    pub fn may_view_embargoed(&self, attributed: &[SectionTitle]) -> bool {
+        if self.max_access.is_some_and(|m| !m.can_read()) {
+            return false;
+        }
+        self.operator
+            || self.global_maintainer
+            || attributed
+                .iter()
+                .any(|title| self.maintained_sections.contains(title))
+    }
+
+    /// Whether this principal may view embargoed review results on every
+    /// patchset regardless of which MAINTAINERS sections it touches.
+    pub fn has_global_embargo_visibility(&self) -> bool {
+        self.max_access.is_none_or(|m| m.can_read()) && (self.operator || self.global_maintainer)
+    }
+
+    /// Whether this principal holds any maintainer or operator standing that
+    /// could grant embargo visibility on at least one patchset.
+    pub fn has_any_embargo_visibility(&self) -> bool {
+        self.max_access.is_none_or(|m| m.can_read())
+            && (self.operator || self.global_maintainer || !self.maintained_sections.is_empty())
+    }
+
     /// Whether this principal may release a review embargo on a patchset from
     /// the MAINTAINERS sections attributed to it.
     pub fn may_release_embargo(&self, attributed: &[SectionTitle]) -> bool {
@@ -909,21 +935,54 @@ F:	*/
         assert!(clm.may_release_embargo(&btrfs()));
         assert!(!clm.may_release_embargo(&net));
 
-        // Scoped API token with Read or Comment ceiling attenuates embargo release.
+        // Scoped API token with Read or Comment ceiling attenuates embargo release,
+        // but still permits viewing embargoed results on maintained sections unless
+        // attenuated to None.
+        let clm_none = clm.clone().with_max_access(Some(BugAccess::None));
+        assert!(!clm_none.may_view_embargoed(&btrfs()));
+        assert!(!clm_none.has_any_embargo_visibility());
+        assert!(!clm_none.may_release_embargo(&btrfs()));
         let clm_read = clm.clone().with_max_access(Some(BugAccess::Read));
+        assert!(clm_read.may_view_embargoed(&btrfs()));
+        assert!(!clm_read.may_view_embargoed(&net));
+        assert!(clm_read.has_any_embargo_visibility());
+        assert!(!clm_read.has_global_embargo_visibility());
         assert!(!clm_read.may_release_embargo(&btrfs()));
         let clm_comment = clm.clone().with_max_access(Some(BugAccess::Comment));
+        assert!(clm_comment.may_view_embargoed(&btrfs()));
         assert!(!clm_comment.may_release_embargo(&btrfs()));
         let clm_manage = clm.with_max_access(Some(BugAccess::Manage));
+        assert!(clm_manage.may_view_embargoed(&btrfs()));
         assert!(clm_manage.may_release_embargo(&btrfs()));
 
-        // Global maintainer (THE REST) and operator can release even unattributed patchsets.
+        // Global maintainer (THE REST) and operator can view and release even unattributed patchsets.
         let torvalds = Principal::resolve("torvalds@linux-foundation.org", &acl_cfg, Some(&idx));
+        assert!(torvalds.may_view_embargoed(&btrfs()));
+        assert!(torvalds.may_view_embargoed(&[]));
+        assert!(torvalds.has_global_embargo_visibility());
+        assert!(torvalds.has_any_embargo_visibility());
         assert!(torvalds.may_release_embargo(&btrfs()));
         assert!(torvalds.may_release_embargo(&[]));
 
         let op = Principal::resolve("operator@example.org", &acl_cfg, Some(&idx));
+        assert!(op.may_view_embargoed(&btrfs()));
+        assert!(op.may_view_embargoed(&[]));
+        assert!(op.has_global_embargo_visibility());
+        assert!(op.has_any_embargo_visibility());
         assert!(op.may_release_embargo(&btrfs()));
         assert!(op.may_release_embargo(&[]));
+
+        assert!(!anon.may_view_embargoed(&btrfs()));
+        assert!(!anon.has_any_embargo_visibility());
+        assert!(!stranger.may_view_embargoed(&btrfs()));
+        assert!(!stranger.has_any_embargo_visibility());
+        assert!(!sec.may_view_embargoed(&btrfs()));
+        assert!(!sec.has_any_embargo_visibility());
+        assert!(davem.may_view_embargoed(&net));
+        assert!(!davem.may_view_embargoed(&btrfs()));
+        assert!(!davem.may_view_embargoed(&[]));
+        assert!(davem.has_any_embargo_visibility());
+        assert!(!davem.has_global_embargo_visibility());
+        assert!(!clm_blocked.may_view_embargoed(&btrfs()));
     }
 }

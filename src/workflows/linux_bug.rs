@@ -867,7 +867,9 @@ impl LlmSession for DedupSession<'_> {
 
         let bug_header = match self.project {
             ProjectId::Linux => "Newly Verified Linux Kernel Bug:",
-            ProjectId::Sashiko | crate::project::ProjectId::Kannaka => "Newly Verified Sashiko Bug:",
+            ProjectId::Sashiko | crate::project::ProjectId::Kannaka => {
+                "Newly Verified Sashiko Bug:"
+            }
         };
 
         format!(
@@ -2232,7 +2234,9 @@ pub async fn process_issue_worker_for_project(
     } else {
         match project {
             ProjectId::Linux => "sashiko:linux_bug".to_string(),
-            ProjectId::Sashiko | crate::project::ProjectId::Kannaka => "sashiko:sashiko_bug".to_string(),
+            ProjectId::Sashiko | crate::project::ProjectId::Kannaka => {
+                "sashiko:sashiko_bug".to_string()
+            }
         }
     };
     let attributed_db =

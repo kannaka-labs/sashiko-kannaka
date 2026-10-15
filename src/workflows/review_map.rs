@@ -404,11 +404,6 @@ fn build_threads(state: &LinuxPatchReviewState) -> Vec<Value> {
             .or_else(|| vf.get("id"))
             .and_then(Value::as_str)
             .map(str::to_string);
-        let finding_id = vf
-            .get("finding_id")
-            .or_else(|| vf.get("id"))
-            .and_then(Value::as_str)
-            .map(str::to_string);
         let source_ids = extract_string_array(vf, "source_ids");
         let (raw_concerns, raw_dismissed) = split_raw_ids(&source_ids);
         for id in raw_concerns.iter().chain(raw_dismissed.iter()) {
@@ -426,7 +421,6 @@ fn build_threads(state: &LinuxPatchReviewState) -> Vec<Value> {
 
         threads.push(json!({
             "outcome": outcome,
-            "finding_id": finding_id,
             "title": item_title(vf),
             "type": item_type(vf, state),
             "severity": item_severity(vf, &state.hard_cases),
@@ -448,11 +442,6 @@ fn build_threads(state: &LinuxPatchReviewState) -> Vec<Value> {
     for pvf in &state.post_verification_findings {
         let pvf_id = pvf
             .get("stage_item_id")
-            .or_else(|| pvf.get("id"))
-            .and_then(Value::as_str)
-            .map(str::to_string);
-        let finding_id = pvf
-            .get("finding_id")
             .or_else(|| pvf.get("id"))
             .and_then(Value::as_str)
             .map(str::to_string);
@@ -483,7 +472,6 @@ fn build_threads(state: &LinuxPatchReviewState) -> Vec<Value> {
 
         threads.push(json!({
             "outcome": outcome,
-            "finding_id": finding_id,
             "title": item_title(pvf),
             "type": item_type(pvf, state),
             "severity": item_severity(pvf, &state.hard_cases),
@@ -522,7 +510,6 @@ fn build_threads(state: &LinuxPatchReviewState) -> Vec<Value> {
 
         threads.push(json!({
             "outcome": "refuted_hard_case",
-            "finding_id": Value::Null,
             "title": item_title(pvd),
             "type": item_type(pvd, state),
             "severity": item_severity(pvd, &state.hard_cases),
@@ -555,7 +542,6 @@ fn build_threads(state: &LinuxPatchReviewState) -> Vec<Value> {
         }
         threads.push(json!({
             "outcome": "unresolved_hard_case",
-            "finding_id": Value::Null,
             "title": item_title(hc),
             "type": item_type(hc, state),
             "severity": item_severity(hc, &state.hard_cases),
@@ -583,7 +569,6 @@ fn build_threads(state: &LinuxPatchReviewState) -> Vec<Value> {
         }
         threads.push(json!({
             "outcome": "dismissed_1b",
-            "finding_id": Value::Null,
             "title": item_title(vd),
             "type": item_type(vd, state),
             "severity": "",
@@ -611,7 +596,6 @@ fn build_threads(state: &LinuxPatchReviewState) -> Vec<Value> {
         }
         threads.push(json!({
             "outcome": "unverified_concern",
-            "finding_id": Value::Null,
             "title": item_title(c),
             "type": item_type(c, state),
             "severity": "",
@@ -638,7 +622,6 @@ fn build_threads(state: &LinuxPatchReviewState) -> Vec<Value> {
         }
         threads.push(json!({
             "outcome": "unverified_dismissed",
-            "finding_id": Value::Null,
             "title": item_title(d),
             "type": item_type(d, state),
             "severity": "",
@@ -770,7 +753,6 @@ mod tests {
             verification_findings: vec![json!({
                 "id": "VF1",
                 "stage_item_id": "VF1",
-                "finding_id": "linux-11111111-2222-4333-8444-555555555555",
                 "source_ids": ["C1"],
                 "problem": "net: unchecked return value in foo()",
                 "severity": "High",
@@ -851,10 +833,6 @@ mod tests {
         assert_eq!(threads[0]["thread_id"], "T1");
         assert_eq!(threads[0]["outcome"], "finding");
         assert_eq!(threads[0]["type"], "Logic Defect");
-        assert_eq!(
-            threads[0]["finding_id"],
-            "linux-11111111-2222-4333-8444-555555555555"
-        );
         assert_eq!(threads[0]["raw_concern_ids"], json!(["C1"]));
 
         assert_eq!(threads[1]["thread_id"], "T2");

@@ -48,7 +48,7 @@ anything contested goes to tool-assisted post-verification.
 
 ## The prompt set
 
-[`prompts/kannaka/`](prompts/kannaka/README.md), compiled into the binary:
+[`projects/kannaka/prompts/`](projects/kannaka/prompts/README.md), compiled into the binary:
 
 - `review-core.md`, `severity.md`, `false-positive-guide.md`, `prompt-injection.md`, `github-summary-template.md`
 - nine cross-cutting patterns: silent failure, error handling, concurrency, retries and refusals, wire contracts,
@@ -65,7 +65,7 @@ anything contested goes to tool-assisted post-verification.
 | `gsr-store.md` | the USDC record store and its gasless relayer |
 | `kshb-harness.md` | the KSHB research harness |
 
-The pre-screen stage picks guides from [`subsystem/subsystem.md`](prompts/kannaka/subsystem/subsystem.md) by path
+The pre-screen stage picks guides from [`subsystem/subsystem.md`](projects/kannaka/prompts/subsystem/subsystem.md) by path
 and symbol. When code changes, the guide that describes it should change in the same pull request.
 
 Writing these guides found real defects, all fixed since: a rate limit keyed on a header the caller controls and
@@ -134,7 +134,7 @@ sees only the prompt Sashiko builds (about 3,000 tokens). The flags live in `cla
 | Routing | `src/workflows/mod.rs`, `src/workflows/review_map.rs`, `src/worker/prompts.rs`, `src/prompt_bundle.rs`, `src/reviewer.rs` |
 | Bug tracker refusal | `src/main.rs` (`run_daemon`); tracker arms shared in `src/workflows/linux_bug.rs`, `src/worker/bug_worker.rs` |
 | CLI isolation | `src/ai/claude_cli.rs` (`claude_cli_args`) |
-| Prompts | `prompts/kannaka/` |
+| Prompts and mail policy | `projects/kannaka/prompts/`, `projects/kannaka/mailing_lists.toml` |
 
 Kannaka Labs changes are marked in the files they touch. To pull upstream improvements:
 `git fetch upstream && git merge upstream/main` (the fork only adds files and match arms, so conflicts are rare).

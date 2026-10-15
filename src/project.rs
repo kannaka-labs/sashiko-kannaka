@@ -90,6 +90,17 @@ impl ProjectId {
             ProjectId::Sashiko | ProjectId::Kannaka => false,
         }
     }
+
+    /// The path to the file holding this project's tracked mailing lists and
+    /// outbound email routing policy.
+    pub fn mailing_lists_path(self) -> &'static str {
+        match self {
+            ProjectId::Linux => "projects/linux/mailing_lists.toml",
+            ProjectId::Sashiko => "projects/sashiko/mailing_lists.toml",
+            // Kannaka Labs: reviews are local and post nothing, so every list is muted.
+            ProjectId::Kannaka => "projects/kannaka/mailing_lists.toml",
+        }
+    }
 }
 
 impl fmt::Display for ProjectId {
@@ -139,11 +150,8 @@ impl ProjectId {
     /// Every project, for error messages and for tests that must cover them
     /// all. Adding a variant without adding it here fails the exhaustiveness
     /// test below.
-    pub const ALL: &'static [ProjectId] = &[
-        ProjectId::Linux,
-        ProjectId::Sashiko,
-        ProjectId::Kannaka,
-    ];
+    pub const ALL: &'static [ProjectId] =
+        &[ProjectId::Linux, ProjectId::Sashiko, ProjectId::Kannaka];
 }
 
 #[cfg(test)]

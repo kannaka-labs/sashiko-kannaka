@@ -674,6 +674,9 @@ async fn list_mailing_lists(
 }
 
 async fn list_patchsets(
+    auth: crate::auth::OptionalAuthUser,
+    OptionalPrincipal(principal): OptionalPrincipal,
+    headers: axum::http::HeaderMap,
     State(state): State<Arc<AppState>>,
     Query(pagination): Query<Pagination>,
 ) -> Result<Json<PatchsetsResponse>, StatusCode> {
@@ -681,7 +684,7 @@ async fn list_patchsets(
     let per_page = pagination.per_page.unwrap_or(50).clamp(1, 100);
     let offset = (page - 1) * per_page;
 
-    let items = if pagination.q.is_none()
+    let mut items = if pagination.q.is_none()
         && pagination.mailing_list.is_none()
         && page == 1
         && per_page == 50
@@ -708,6 +711,9 @@ async fn list_patchsets(
             .await
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
     };
+    populate_embargoed_patchset_findings(&state, &headers, auth.0.as_ref(), &principal, &mut items)
+        .await?;
+
     let total = if pagination.q.is_none() && pagination.mailing_list.is_none() {
         state
             .patchsets_count_cache
@@ -797,33 +803,48 @@ async fn list_messages(
     }))
 }
 
-async fn can_release_patchset_embargo(
-    state: &Arc<AppState>,
-    headers: &axum::http::HeaderMap,
-    auth: Option<&crate::auth::AuthUser>,
-    principal: &Principal,
-    patchset_id: i64,
-) -> Result<bool, StatusCode> {
-    if state.read_only {
-        return Ok(false);
-    }
+fn is_auth_blocklisted(state: &AppState, auth: Option<&crate::auth::AuthUser>) -> bool {
     if let Some(user) = auth {
         if state.settings.server.acl.is_blocklisted(&user.email) {
-            return Ok(false);
+            return true;
         }
         if user
             .sid
             .as_deref()
             .is_some_and(|sid| state.settings.server.acl.is_blocklisted(sid))
         {
-            return Ok(false);
+            return true;
         }
     }
-    if is_authorized(state, headers, auth, crate::settings::Permission::Review) {
-        return Ok(true);
+    false
+}
+
+/// Resolves `(can_view_embargoed, can_release_embargo)` for an embargoed
+/// patchset in a single pass.
+///
+/// Viewing embargoed results is a read operation: it is permitted in
+/// `read_only` mode and for read-scoped API tokens (`BugAccess::Read`), whereas
+/// releasing an embargo mutates state and requires `!state.read_only` and
+/// `BugAccess::Manage` (or `Permission::Review`).
+async fn resolve_patchset_embargo_access(
+    state: &Arc<AppState>,
+    headers: &axum::http::HeaderMap,
+    auth: Option<&crate::auth::AuthUser>,
+    principal: &Principal,
+    patchset_id: i64,
+) -> Result<(bool, bool), StatusCode> {
+    if is_auth_blocklisted(state, auth) {
+        return Ok((false, false));
     }
-    if principal.email().is_empty() && !principal.is_operator() {
-        return Ok(false);
+    if is_authorized(state, headers, auth, crate::settings::Permission::Review) {
+        return Ok((true, !state.read_only));
+    }
+    if !principal.has_any_embargo_visibility() {
+        return Ok((false, false));
+    }
+    if principal.has_global_embargo_visibility() {
+        let can_release = !state.read_only && principal.may_release_embargo(&[]);
+        return Ok((true, can_release));
     }
     let sections = state
         .db
@@ -834,22 +855,140 @@ async fn can_release_patchset_embargo(
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
     let titles: Vec<SectionTitle> = sections.iter().map(|s| SectionTitle::new(s)).collect();
-    Ok(principal.may_release_embargo(&titles))
+    let can_view = principal.may_view_embargoed(&titles);
+    let can_release = !state.read_only && principal.may_release_embargo(&titles);
+    Ok((can_view, can_release))
 }
 
+async fn can_release_patchset_embargo(
+    state: &Arc<AppState>,
+    headers: &axum::http::HeaderMap,
+    auth: Option<&crate::auth::AuthUser>,
+    principal: &Principal,
+    patchset_id: i64,
+) -> Result<bool, StatusCode> {
+    let (_, can_release) =
+        resolve_patchset_embargo_access(state, headers, auth, principal, patchset_id).await?;
+    Ok(can_release)
+}
+
+/// Populates `findings_low/medium/high/critical` on embargoed rows in `items`
+/// when the caller is authorized to view embargoed results for those patchsets.
+async fn populate_embargoed_patchset_findings(
+    state: &Arc<AppState>,
+    headers: &axum::http::HeaderMap,
+    auth: Option<&crate::auth::AuthUser>,
+    principal: &Principal,
+    items: &mut [crate::db::PatchsetRow],
+) -> Result<(), StatusCode> {
+    if is_auth_blocklisted(state, auth) {
+        return Ok(());
+    }
+    let now = chrono::Utc::now().timestamp();
+    let embargoed_ids: Vec<i64> = items
+        .iter()
+        .filter(|row| {
+            row.status.as_deref() == Some("Embargoed")
+                || row.embargo_until.is_some_and(|until| until > now)
+        })
+        .map(|row| row.id)
+        .collect();
+    if embargoed_ids.is_empty() {
+        return Ok(());
+    }
+
+    let visible_ids: std::collections::HashSet<i64> =
+        if is_authorized(state, headers, auth, crate::settings::Permission::Review)
+            || principal.has_global_embargo_visibility()
+        {
+            embargoed_ids.iter().copied().collect()
+        } else if !principal.has_any_embargo_visibility() {
+            return Ok(());
+        } else {
+            let sections = state
+                .db
+                .authorizing_sections_for_patchsets(&embargoed_ids)
+                .await
+                .map_err(|e| {
+                    tracing::error!("Database error resolving patchsets authority: {}", e);
+                    StatusCode::INTERNAL_SERVER_ERROR
+                })?;
+            embargoed_ids
+                .iter()
+                .copied()
+                .filter(|id| {
+                    let titles: Vec<SectionTitle> = sections
+                        .get(id)
+                        .map(|names| names.iter().map(|s| SectionTitle::new(s)).collect())
+                        .unwrap_or_default();
+                    principal.may_view_embargoed(&titles)
+                })
+                .collect()
+        };
+
+    if visible_ids.is_empty() {
+        return Ok(());
+    }
+
+    let visible_vec: Vec<i64> = visible_ids.iter().copied().collect();
+    let counts = state
+        .db
+        .get_patchset_finding_counts(&visible_vec)
+        .await
+        .map_err(|e| {
+            tracing::error!("Database error fetching embargoed finding counts: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+    for row in items.iter_mut() {
+        if visible_ids.contains(&row.id) {
+            let (low, medium, high, critical) =
+                counts.get(&row.id).copied().unwrap_or((0, 0, 0, 0));
+            row.findings_low = Some(low);
+            row.findings_medium = Some(medium);
+            row.findings_high = Some(high);
+            row.findings_critical = Some(critical);
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn attach_patchset_flags(
     state: &Arc<AppState>,
     headers: &axum::http::HeaderMap,
     auth: Option<&crate::auth::AuthUser>,
     principal: &Principal,
     details: &mut serde_json::Value,
+    page: Option<u32>,
+    per_page: Option<u32>,
+    include_logs: bool,
 ) -> Result<(), StatusCode> {
-    let can_release = if details.get("status").and_then(|v| v.as_str()) == Some("Embargoed")
+    let now = chrono::Utc::now().timestamp();
+    let is_embargoed = details
+        .get("embargo_until")
+        .and_then(|v| v.as_i64())
+        .is_some_and(|until| until > now);
+    let (can_view, can_release) = if is_embargoed
         && let Some(ps_id) = details.get("id").and_then(|v| v.as_i64())
     {
-        can_release_patchset_embargo(state, headers, auth, principal, ps_id).await?
+        let (view, release) =
+            resolve_patchset_embargo_access(state, headers, auth, principal, ps_id).await?;
+        if view {
+            let reviews = state
+                .db
+                .get_embargoed_patchset_reviews(ps_id, page, per_page, include_logs)
+                .await
+                .map_err(|e| {
+                    tracing::error!("Database error fetching embargoed patchset reviews: {}", e);
+                    StatusCode::INTERNAL_SERVER_ERROR
+                })?;
+            if let Some(obj) = details.as_object_mut() {
+                obj.insert("reviews".to_string(), serde_json::Value::Array(reviews));
+            }
+        }
+        (view, release)
     } else {
-        false
+        (false, false)
     };
     if let Some(obj) = details.as_object_mut() {
         obj.insert(
@@ -859,6 +998,10 @@ async fn attach_patchset_flags(
         obj.insert(
             "dry_run".to_string(),
             serde_json::Value::Bool(state.dry_run),
+        );
+        obj.insert(
+            "can_view_embargoed".to_string(),
+            serde_json::Value::Bool(can_view),
         );
         obj.insert(
             "can_release_embargo".to_string(),
@@ -897,8 +1040,17 @@ async fn get_patchset(
 
     match result {
         Ok(Some(mut details)) => {
-            attach_patchset_flags(&state, &headers, auth.0.as_ref(), &principal, &mut details)
-                .await?;
+            attach_patchset_flags(
+                &state,
+                &headers,
+                auth.0.as_ref(),
+                &principal,
+                &mut details,
+                query.page,
+                query.per_page,
+                true,
+            )
+            .await?;
             redact_embedded_bugs(&state, &principal, &mut details).await?;
             Ok(Json(details))
         }
@@ -913,8 +1065,33 @@ async fn get_patchset(
     }
 }
 
+async fn enforce_review_embargo(
+    state: &Arc<AppState>,
+    headers: &axum::http::HeaderMap,
+    auth: Option<&crate::auth::AuthUser>,
+    principal: &Principal,
+    details: &serde_json::Value,
+) -> Result<(), StatusCode> {
+    let now = chrono::Utc::now().timestamp();
+    if let Some(until) = details.get("embargo_until").and_then(|v| v.as_i64())
+        && until > now
+    {
+        let Some(ps_id) = details.get("patchset_id").and_then(|v| v.as_i64()) else {
+            return Err(StatusCode::NOT_FOUND);
+        };
+        let (can_view, _) =
+            resolve_patchset_embargo_access(state, headers, auth, principal, ps_id).await?;
+        if !can_view {
+            return Err(StatusCode::NOT_FOUND);
+        }
+    }
+    Ok(())
+}
+
 async fn get_review(
+    auth: crate::auth::OptionalAuthUser,
     OptionalPrincipal(principal): OptionalPrincipal,
+    headers: axum::http::HeaderMap,
     State(state): State<Arc<AppState>>,
     Query(query): Query<ReviewQuery>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
@@ -930,6 +1107,7 @@ async fn get_review(
 
     match result {
         Ok(Some(mut details)) => {
+            enforce_review_embargo(&state, &headers, auth.0.as_ref(), &principal, &details).await?;
             redact_embedded_bugs(&state, &principal, &mut details).await?;
             Ok(Json(details))
         }
@@ -973,8 +1151,17 @@ async fn get_patchset_summary(
 
     match result {
         Ok(Some(mut details)) => {
-            attach_patchset_flags(&state, &headers, auth.0.as_ref(), &principal, &mut details)
-                .await?;
+            attach_patchset_flags(
+                &state,
+                &headers,
+                auth.0.as_ref(),
+                &principal,
+                &mut details,
+                query.page,
+                query.per_page,
+                false,
+            )
+            .await?;
             Ok(Json(details))
         }
         Ok(None) => {
@@ -989,7 +1176,9 @@ async fn get_patchset_summary(
 }
 
 async fn get_review_log(
+    auth: crate::auth::OptionalAuthUser,
     OptionalPrincipal(principal): OptionalPrincipal,
+    headers: axum::http::HeaderMap,
     State(state): State<Arc<AppState>>,
     Query(query): Query<ReviewQuery>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
@@ -1005,6 +1194,7 @@ async fn get_review_log(
 
     match result {
         Ok(Some(mut details)) => {
+            enforce_review_embargo(&state, &headers, auth.0.as_ref(), &principal, &details).await?;
             redact_embedded_bugs(&state, &principal, &mut details).await?;
             Ok(Json(details))
         }
@@ -2393,6 +2583,133 @@ fn bug_lookup_denial(status: StatusCode) -> (StatusCode, String) {
     (status, message.to_string())
 }
 
+/// Longest part of a bug title, in bytes, that an assignment notice's
+/// subject carries.
+const ASSIGNMENT_SUBJECT_TITLE_BYTES: usize = 80;
+
+/// Longest part of the assigner's note, in bytes, that an assignment notice
+/// carries. The whole note is on the bug page as a comment.
+const ASSIGNMENT_NOTE_BYTES: usize = 4096;
+
+/// Renders the subject and body of the notice sent to a bug's new assignee.
+fn build_bug_assignment_email(
+    assigner: &str,
+    title: &str,
+    link: &str,
+    note: Option<&str>,
+    base_url: &str,
+) -> (String, String) {
+    // Titles are model output and can span lines, which a subject cannot.
+    let title = title.split_whitespace().collect::<Vec<_>>().join(" ");
+    let short_title = crate::utils::utf8_prefix(&title, ASSIGNMENT_SUBJECT_TITLE_BYTES);
+    let ellipsis = if short_title.len() < title.len() {
+        "..."
+    } else {
+        ""
+    };
+    let subject = format!("[sashiko] {assigner} assigned you a bug: {short_title}{ellipsis}");
+
+    let note_block = match note.map(str::trim).filter(|n| !n.is_empty()) {
+        Some(note) => {
+            let shown = crate::utils::utf8_prefix(note, ASSIGNMENT_NOTE_BYTES);
+            let mut indented: Vec<String> = shown
+                .lines()
+                .map(|line| match line.trim_end() {
+                    "" => String::new(),
+                    line => format!("  {line}"),
+                })
+                .collect();
+            if shown.len() < note.len() {
+                indented.push("  [...] The full note is on the bug page.".to_string());
+            }
+            format!("Their note:\n\n{}\n\n", indented.join("\n"))
+        }
+        None => String::new(),
+    };
+    let body = format!(
+        "{assigner} assigned you this Sashiko bug report:\n\n\
+         \x20 {title}\n\
+         \x20 {link}\n\n\
+         {note_block}\
+         The link opens the report without signing in, for anyone who has it.\n\n\
+         Questions about the assignment go to {assigner}, who is on Cc.\n\n\
+         -- \n\
+         Sashiko AI review · {base_url}"
+    );
+    (subject, body)
+}
+
+/// Whether an assignment notice may go to `address`.
+///
+/// Email to a list address lands in the list's public archive with the bug's
+/// link, and an address that is not a plain one, Sashiko's own, or a
+/// blocklisted one is not a person to notify.
+fn is_notifiable_address(
+    state: &AppState,
+    smtp: &crate::settings::SmtpSettings,
+    address: &str,
+) -> bool {
+    let Ok(parsed) = address.parse::<lettre::Address>() else {
+        return false;
+    };
+    let domain = parsed.domain().to_ascii_lowercase();
+    !crate::email_router::KNOWN_MAILING_LIST_DOMAINS.contains(&domain.as_str())
+        && crate::email_policy::extract_bare_email(&smtp.sender_address)
+            != address.to_ascii_lowercase()
+        && !state.settings.server.acl.is_blocklisted(address)
+}
+
+/// The notice to queue with an assignment.
+struct AssignmentNotice {
+    subject: String,
+    body: String,
+    status: &'static str,
+}
+
+/// Builds the email to a bug's new assignee, naming who assigned it, or
+/// None when no notice is due. assign_bug() drops it when the assignee is
+/// unchanged.
+fn assignment_notice(
+    state: &AppState,
+    bug: &crate::db::Bug,
+    assigner: &str,
+    assignee: &str,
+    note: Option<&str>,
+) -> Option<AssignmentNotice> {
+    let smtp = state.settings.smtp.as_ref()?;
+    // Nobody to name, or an assignee who already knows. Addresses that
+    // differ only in case name one person.
+    if assigner.is_empty() || assignee.eq_ignore_ascii_case(assigner) {
+        return None;
+    }
+    if !is_notifiable_address(state, smtp, assignee) {
+        tracing::warn!(
+            "Not emailing the new assignee of bug {}: {} is a list, Sashiko's own, \
+             blocklisted or not a plain address",
+            bug.bugid,
+            assignee
+        );
+        return None;
+    }
+
+    let Some(base_url) = state.settings.server.mailed_link_base_url() else {
+        tracing::error!(
+            "Not emailing the new assignee of bug {}: server.public_base_url is \
+             not a reachable URL",
+            bug.bugid
+        );
+        return None;
+    };
+    let link = format!("{}/bug/{}", base_url, bug.bugid);
+    let (subject, body) = build_bug_assignment_email(assigner, &bug.title, &link, note, &base_url);
+    let status = if smtp.dry_run { "Dry-Run" } else { "Pending" };
+    Some(AssignmentNotice {
+        subject,
+        body,
+        status,
+    })
+}
+
 async fn bug_action(
     principal: Principal,
     axum::extract::ConnectInfo(addr): axum::extract::ConnectInfo<std::net::SocketAddr>,
@@ -2536,7 +2853,22 @@ async fn bug_action(
                     "Assignee must be an email address".into(),
                 ));
             }
-            db.assign_bug(bug.id, assignee, reason.as_deref())
+            let assigner = [principal.email()];
+            let notice = assignee.and_then(|who| {
+                assignment_notice(&state, &bug, assigner[0], who, reason.as_deref())
+                    .map(|notice| (who, notice))
+            });
+            let email = notice
+                .as_ref()
+                .map(|(who, notice)| crate::db::TransactionalEmail {
+                    kind: crate::db::EmailKind::BugAssignment,
+                    status: notice.status,
+                    to_address: who,
+                    cc_addresses: &assigner,
+                    subject: &notice.subject,
+                    body: &notice.body,
+                });
+            db.assign_bug(bug.id, assignee, reason.as_deref(), email.as_ref())
                 .await
                 .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
         }
@@ -3813,6 +4145,174 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_bug_assignment_emails_only_a_new_assignee() {
+        const SECRET: &str = "bug-assign-secret-123456789012345678901";
+        let db_settings = crate::settings::DatabaseSettings {
+            url: ":memory:".to_string(),
+            token: String::new(),
+        };
+        let db = Arc::new(Database::new(&db_settings).await.unwrap());
+        db.migrate().await.unwrap();
+        let bug_id = db
+            .create_bug(&crate::db::NewBug {
+                bugid: "linux-assign01".to_string(),
+                title: "UAF in\nbtrfs".to_string(),
+                lifecycle_status: crate::db::BugLifecycleStatus::New,
+                pipeline_state: crate::db::BugPipelineState::Pending,
+                assignee: None,
+                reporter: "sashiko".to_string(),
+                reported_at: 123456,
+                discovered_in_patchset_id: None,
+                discovered_in_patch_id: None,
+                discovered_in_commit: None,
+                source_ref: None,
+                vector_json: None,
+                duplicate_of_id: None,
+                subsystems: vec![crate::db::AttributedSubsystem::from_maintainers(
+                    "BTRFS FILE SYSTEM",
+                )],
+            })
+            .await
+            .unwrap();
+
+        let mut settings = crate::settings::Settings::new().unwrap();
+        settings.server.testing_mode = false;
+        settings.server.read_only = false;
+        settings.server.jwt_secret = Some(SECRET.to_string());
+        settings.server.public_base_url = Some("https://sashiko.dev".to_string());
+        settings.server.acl.admins = vec!["lead@example.org".to_string()];
+        settings.server.acl.blocklist = vec!["revoked@example.org".to_string()];
+        settings.smtp = Some(crate::settings::SmtpSettings {
+            server: "smtp.example.org".to_string(),
+            port: 587,
+            username: None,
+            password: None,
+            sender_address: "sashiko@sashiko.dev".to_string(),
+            reply_to: None,
+            dry_run: false,
+        });
+
+        let (event_tx, _event_rx) = mpsc::channel(10);
+        let (fetch_tx, _fetch_rx) = mpsc::channel(10);
+        let app = build_router(
+            Arc::new(settings),
+            db.clone(),
+            event_tx,
+            fetch_tx,
+            ServerOptions {
+                smtp_enabled: true,
+                ..Default::default()
+            },
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+            .unwrap();
+        });
+
+        let client = reqwest::Client::new();
+        let token = crate::auth::create_token(
+            "lead@example.org",
+            SECRET,
+            Some("session".to_string()),
+            3600,
+        )
+        .unwrap();
+        let assign = |assignee: Option<&str>, reason: Option<&str>| {
+            client
+                .post(format!("http://{}/api/bug/action?id={}", addr, bug_id))
+                .header("Authorization", format!("Bearer {}", token))
+                .json(&serde_json::json!({
+                    "action": "assign",
+                    "assignee": assignee,
+                    "reason": reason,
+                }))
+                .send()
+        };
+
+        let res = assign(Some("dev@example.org"), Some("Could you take this?"))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 200);
+        let email = db
+            .lock_pending_email()
+            .await
+            .unwrap()
+            .expect("assignment notice queued");
+        assert_eq!(email.kind, crate::db::EmailKind::BugAssignment);
+        assert_eq!(email.to_addresses, r#"["dev@example.org"]"#);
+        assert_eq!(email.cc_addresses, r#"["lead@example.org"]"#);
+        assert_eq!(
+            email.subject,
+            "[sashiko] lead@example.org assigned you a bug: UAF in btrfs"
+        );
+        assert!(
+            email
+                .body
+                .starts_with("lead@example.org assigned you this Sashiko bug report:\n\n")
+        );
+        assert!(
+            email
+                .body
+                .contains("  UAF in btrfs\n  https://sashiko.dev/bug/linux-assign01\n")
+        );
+        assert!(
+            email
+                .body
+                .contains("Their note:\n\n  Could you take this?\n\n")
+        );
+        assert!(
+            email
+                .body
+                .contains("Questions about the assignment go to lead@example.org")
+        );
+        db.mark_email_sent(email.id).await.unwrap();
+
+        // The same assignee again, in either case, a list, Sashiko's own,
+        // a blocklisted or a non-plain address, a self-assignment and an
+        // unassignment queue no notice.
+        for assignee in [
+            Some("dev@example.org"),
+            Some("Dev@example.org"),
+            Some("kvmarm@lists.linux.dev"),
+            Some("sashiko@sashiko.dev"),
+            Some("revoked@example.org"),
+            Some("x<y@example.com>@example.org"),
+            Some("lead@example.org"),
+            None,
+        ] {
+            let res = assign(assignee, None).await.unwrap();
+            assert_eq!(res.status(), 200);
+        }
+        assert!(db.lock_pending_email().await.unwrap().is_none());
+        assert_eq!(db.get_bug(bug_id).await.unwrap().unwrap().assignee, None);
+    }
+
+    #[test]
+    fn test_bug_assignment_email_bounds_the_title_and_note() {
+        let title = "é".repeat(100);
+        let link = "https://sashiko.dev/bug/linux-x";
+        let base = "https://sashiko.dev";
+        let (subject, body) =
+            build_bug_assignment_email("lead@example.org", &title, link, Some("   "), base);
+        assert!(subject.ends_with(&format!("{}...", "é".repeat(40))));
+        assert!(body.contains(&title));
+        assert!(!body.contains("Their note"));
+
+        let note = "x".repeat(ASSIGNMENT_NOTE_BYTES + 1);
+        let (_, body) =
+            build_bug_assignment_email("lead@example.org", "t", link, Some(&note), base);
+        assert!(body.contains(&format!("  {}\n", "x".repeat(ASSIGNMENT_NOTE_BYTES))));
+        assert!(!body.contains(&note));
+        assert!(body.contains("  [...] The full note is on the bug page.\n"));
+    }
+
+    #[tokio::test]
     async fn test_request_link_unconditional_response_equivalence() {
         let db_settings = crate::settings::DatabaseSettings {
             url: ":memory:".to_string(),
@@ -4945,6 +5445,50 @@ F:	net/
             .await
             .unwrap()
             .unwrap();
+        db.create_message(
+            "<embargo-srv@example.com>",
+            thread_id,
+            None,
+            "Author <author@example.com>",
+            "[PATCH] btrfs: fix",
+            now,
+            "",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let patch_id = db
+            .create_patch(ps_id, "<embargo-srv@example.com>", 1, "diff")
+            .await
+            .unwrap();
+        let review_id = db
+            .create_review(ps_id, Some(patch_id), "gemini", "gemini-2.5", None, None)
+            .await
+            .unwrap();
+        db.complete_review(
+            review_id,
+            "Reviewed",
+            "Found high severity issue",
+            Some("Use-after-free in btrfs"),
+            None,
+            Some("inline review text"),
+            Some("{\"step\":\"done\"}"),
+        )
+        .await
+        .unwrap();
+        db.create_finding(crate::db::Finding {
+            review_id,
+            severity: crate::db::Severity::High,
+            severity_explanation: Some("Exploitable UAF".to_string()),
+            problem: "Use-after-free in btrfs".to_string(),
+            preexisting: Some(false),
+            locations: None,
+        })
+        .await
+        .unwrap();
         db.update_patchset_status(ps_id, "Reviewed").await.unwrap();
         db.set_patchset_embargo_until(ps_id, now + 3600)
             .await
@@ -5024,8 +5568,15 @@ F:	*
             page: None,
             per_page: None,
         };
+        let list_pagination = || Pagination {
+            page: Some(1),
+            per_page: Some(50),
+            q: None,
+            mailing_list: None,
+        };
 
-        // 1. Anonymous caller sees can_release_embargo = false and is rejected with 403.
+        // 1. Anonymous caller sees Embargoed with empty reviews, zeroed list counts,
+        // 404 on /api/review, and 403 on release_patchset_embargo.
         let Json(anon_details) = get_patchset(
             crate::auth::OptionalAuthUser(None),
             OptionalPrincipal(Principal::anonymous()),
@@ -5036,7 +5587,35 @@ F:	*
         .await
         .unwrap();
         assert_eq!(anon_details["status"], "Embargoed");
+        assert_eq!(anon_details["can_view_embargoed"], false);
         assert_eq!(anon_details["can_release_embargo"], false);
+        assert_eq!(anon_details["reviews"].as_array().unwrap().len(), 0);
+
+        let Json(anon_list) = list_patchsets(
+            crate::auth::OptionalAuthUser(None),
+            OptionalPrincipal(Principal::anonymous()),
+            headers.clone(),
+            State(state.clone()),
+            Query(list_pagination()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(anon_list.items[0].status.as_deref(), Some("Embargoed"));
+        assert_eq!(anon_list.items[0].findings_high, Some(0));
+
+        let rev_err = get_review(
+            crate::auth::OptionalAuthUser(None),
+            OptionalPrincipal(Principal::anonymous()),
+            headers.clone(),
+            State(state.clone()),
+            Query(ReviewQuery {
+                id: Some(review_id),
+                patchset_id: None,
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(rev_err, StatusCode::NOT_FOUND);
 
         let err = release_patchset_embargo(
             crate::auth::OptionalAuthUser(None),
@@ -5049,7 +5628,8 @@ F:	*
         .unwrap_err();
         assert_eq!(err.0, StatusCode::FORBIDDEN);
 
-        // 2. Unrelated subsystem maintainer (davem) and blocklisted maintainer are denied.
+        // 2. Unrelated subsystem maintainer (davem) and blocklisted maintainer are denied
+        // both viewing embargoed results and releasing the embargo.
         for email in [
             "davem@davemloft.net",
             "stranger@example.org",
@@ -5066,8 +5646,31 @@ F:	*
             .await
             .unwrap();
             assert_eq!(
+                d["can_view_embargoed"], false,
+                "{email} should not have can_view_embargoed"
+            );
+            assert_eq!(
                 d["can_release_embargo"], false,
                 "{email} should not have can_release_embargo"
+            );
+            assert_eq!(
+                d["reviews"].as_array().unwrap().len(),
+                0,
+                "{email} should not see embargoed reviews"
+            );
+            let Json(list) = list_patchsets(
+                auth_for(email),
+                OptionalPrincipal(p.clone()),
+                headers.clone(),
+                State(state.clone()),
+                Query(list_pagination()),
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                list.items[0].findings_high,
+                Some(0),
+                "{email} should not see embargoed finding counts"
             );
             let err = release_patchset_embargo(
                 auth_for(email),
@@ -5081,18 +5684,44 @@ F:	*
             assert_eq!(err.0, StatusCode::FORBIDDEN);
         }
 
-        // 3. Scoped API token with Read ceiling for the subsystem maintainer is denied.
+        // 3. Scoped API token with Read ceiling for the subsystem maintainer CAN view
+        // embargoed results, but is denied releasing the embargo.
         let clm_read = Principal::resolve("clm@fb.com", acl, Some(&index))
             .with_max_access(Some(crate::access::BugAccess::Read));
-        let clm_api_auth = crate::auth::OptionalAuthUser(Some(crate::auth::AuthUser {
-            email: "clm@fb.com".to_string(),
-            typ: Some("api_token".to_string()),
-            iat: Some(now as u64),
-            sid: None,
-            max_bug_access: Some("read".to_string()),
-        }));
+        let clm_api_auth = || {
+            crate::auth::OptionalAuthUser(Some(crate::auth::AuthUser {
+                email: "clm@fb.com".to_string(),
+                typ: Some("api_token".to_string()),
+                iat: Some(now as u64),
+                sid: None,
+                max_bug_access: Some("read".to_string()),
+            }))
+        };
+        let Json(clm_read_details) = get_patchset(
+            clm_api_auth(),
+            OptionalPrincipal(clm_read.clone()),
+            headers.clone(),
+            State(state.clone()),
+            Query(query()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(clm_read_details["status"], "Embargoed");
+        assert_eq!(clm_read_details["can_view_embargoed"], true);
+        assert_eq!(clm_read_details["can_release_embargo"], false);
+        assert_eq!(clm_read_details["reviews"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            clm_read_details["reviews"][0]["inline_review"],
+            "inline review text"
+        );
+        assert_eq!(
+            clm_read_details["reviews"][0]["logs"],
+            "{\"step\":\"done\"}"
+        );
+        assert_eq!(clm_read_details["reviews"][0]["patch_id"], patch_id);
+
         let err = release_patchset_embargo(
-            clm_api_auth,
+            clm_api_auth(),
             OptionalPrincipal(clm_read),
             headers.clone(),
             State(state.clone()),
@@ -5103,7 +5732,8 @@ F:	*
         assert_eq!(err.0, StatusCode::FORBIDDEN);
 
         // 4. Corresponding maintainer (M:), reviewer (R:), global maintainer, operator,
-        // and ACL Permission::Review holder all see can_release_embargo = true.
+        // and ACL Permission::Review holder all see embargoed results immediately AND
+        // have can_release_embargo = true while status remains "Embargoed".
         for email in [
             "clm@fb.com",
             "josef@toxicpanda.com",
@@ -5114,18 +5744,74 @@ F:	*
             let p = Principal::resolve(email, acl, Some(&index));
             let Json(d) = get_patchset_summary(
                 auth_for(email),
-                OptionalPrincipal(p),
+                OptionalPrincipal(p.clone()),
                 headers.clone(),
                 State(state.clone()),
                 Query(query()),
             )
             .await
             .unwrap();
+            assert_eq!(d["status"], "Embargoed");
+            assert_eq!(
+                d["can_view_embargoed"], true,
+                "{email} should have can_view_embargoed"
+            );
             assert_eq!(
                 d["can_release_embargo"], true,
                 "{email} should have can_release_embargo"
             );
+            assert_eq!(
+                d["reviews"].as_array().unwrap().len(),
+                1,
+                "{email} should see embargoed reviews on summary"
+            );
+            assert!(
+                d["reviews"][0].get("logs").is_none(),
+                "summary endpoint must omit review logs"
+            );
+
+            let Json(list) = list_patchsets(
+                auth_for(email),
+                OptionalPrincipal(p.clone()),
+                headers.clone(),
+                State(state.clone()),
+                Query(list_pagination()),
+            )
+            .await
+            .unwrap();
+            assert_eq!(list.items[0].status.as_deref(), Some("Embargoed"));
+            assert_eq!(
+                list.items[0].findings_high,
+                Some(1),
+                "{email} should see embargoed finding counts in list_patchsets"
+            );
+
+            let Json(rev) = get_review(
+                auth_for(email),
+                OptionalPrincipal(p),
+                headers.clone(),
+                State(state.clone()),
+                Query(ReviewQuery {
+                    id: Some(review_id),
+                    patchset_id: None,
+                }),
+            )
+            .await
+            .unwrap();
+            assert_eq!(rev["id"], review_id);
         }
+
+        // Verify the shared homepage cache was not polluted by maintainer list_patchsets calls.
+        let Json(anon_list_after) = list_patchsets(
+            crate::auth::OptionalAuthUser(None),
+            OptionalPrincipal(Principal::anonymous()),
+            headers.clone(),
+            State(state.clone()),
+            Query(list_pagination()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(anon_list_after.items[0].findings_high, Some(0));
 
         // 5. Corresponding maintainer releases the embargo; patchset immediately becomes Reviewed.
         let clm = Principal::resolve("clm@fb.com", acl, Some(&index));
@@ -5165,6 +5851,7 @@ F:	*
         .unwrap();
         assert_eq!(after_details["status"], "Reviewed");
         assert_eq!(after_details["can_release_embargo"], false);
+        assert_eq!(after_details["reviews"].as_array().unwrap().len(), 1);
     }
 }
 
@@ -5350,6 +6037,7 @@ async fn request_link(
                         crate::db::EmailKind::SignInLink,
                         status,
                         email,
+                        &[],
                         "[sashiko] Your sign-in link",
                         &body,
                     )

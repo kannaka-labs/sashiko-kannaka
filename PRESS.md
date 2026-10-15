@@ -31,6 +31,7 @@ In-depth coverage from the premier Linux news source.
 * [Debating the role of large language models in the kernel community](https://lwn.net/Articles/1083275/)
 * [Development statistics for the 7.2 kernel](https://lwn.net/Articles/1088776/)
 * [An update on the Sashiko patch-review system](https://lwn.net/Articles/1096963/)
+* [The 2026 Maintainers Summit](https://lwn.net/Articles/1099594/)
 
 ## The Linux Foundation
 * [Linux Foundation on X](https://x.com/linuxfoundation/status/2036497032429305989)
@@ -53,6 +54,9 @@ Coverage in widely read technical publications.
 * **Phoronix:** [Sashiko AI Reviewing Rust Linux](https://www.phoronix.com/news/Sashiko-AI-Reviewing-Rust-Linux)
 * **Phoronix:** [Linux Is Not Anti-AI](https://www.phoronix.com/news/Linux-Is-Not-Anti-AI)
 * **Phoronix:** [Linux 7.2 Protects Against Crafted Perf Data From Going Rogue](https://www.phoronix.com/news/Linux-7.2-Perf-Tools)
+* **Phoronix:** [HWMON Fixes For Linux 7.2-rc7: "Most Of Them Fixing Critical Or High Severity Bugs"](https://www.phoronix.com/news/Linux-7.2-rc7-HWMON)
+* **Phoronix:** [Google's Sashiko AI Has Completed 191k Patch Reviews, Cited On Nearly 500 Kernel CVEs](https://www.phoronix.com/news/Sashiko-Linux-AI-Metrics)
+* **Phoronix:** [Boro: NVIDIA's Open-Source Effort For AI-Assisted Linux Kernel Development](https://www.phoronix.com/news/NVIDIA-Boro-Linux-Kernel-AI)
 
 ## Blogs & Other Coverage
 * **BigGo Finance:** [Linus Torvalds to AI Critics in Linux Community: 'Fork It or Walk Away'](https://finance.biggo.com/news/98b34433-2e7c-4446-9840-149445bfd8ba)
@@ -60,3 +64,5 @@ Coverage in widely read technical publications.
 * **Let's Data Science:** [Sashiko generates preexisting bug noise for maintainers](https://letsdatascience.com/news/sashiko-generates-preexisting-bug-noise-for-maintainers-52aa419a)
 * **Top AI Product:** [Sashiko caught 53% of Linux kernel bugs...](https://topaiproduct.com/2026/03/22/sashiko-caught-53-of-linux-kernel-bugs-that-every-human-reviewer-missed/)
 * **Gigazine:** [Sashiko Linux bug AI](https://gigazine.net/gsc_news/en/20260319-sashiko-linux-bug-ai/)
+* **Hacker Bikepacker:** [Running Sashiko locally](https://hackerbikepacker.com/local-sashiko)
+* **Hardware Busters:** [Sashiko Has Reviewed 191,000 Linux Kernel Patches, and 463 CVEs This Year Cite It](https://hwbusters.com/news/sashiko-has-reviewed-191000-linux-kernel-patches-and-463-cves-this-year-cite-it/)

@@ -164,6 +164,37 @@ or areas where the author clearly just missed updating some code.   If you
 expect a reasonable maintainer to understand a short explanation, use
 a short explanation.
 
+## Commit Message Issues
+
+For issues in the commit message, quote the entire commit message as the first
+quoted block.  This matches normal mailing list replies, and avoids making the
+review question appear before the text it is reviewing.  Put the question after
+that quoted block.
+
+For a missing Fixes: tag, quote the full commit message:
+
+```
+commit 533c6d48ce4a00a5deb5eea6c921b5d019838b5e
+Author: Yonghong Song <yonghong.song@linux.dev>
+
+>     bpf: Add precision marking and backtracking for stack argument slots
+>
+>     Extend the precision marking and backtracking infrastructure to
+>     support stack argument slots (r11-based accesses). Without this,
+>     precision demands for scalar values passed through stack arguments
+>     are silently dropped, which could allow the verifier to incorrectly
+>     prune states with different constant values in stack arg slots.
+>
+>     Signed-off-by: Yonghong Song <yonghong.song@linux.dev>
+
+[Severity: Low]
+This looks like a bug fix for stack argument support.  Should this include:
+
+  Fixes: 3330ee8db989 ("bpf: Support stack arguments for bpf functions")
+```
+
+Do not write the question before the first quoted commit message or diff block.
+
 ## NEVER QUOTE LINE NUMBERS
 
 - Never mention line numbers when referencing code locations, instead indicate
@@ -217,8 +248,13 @@ fs/btrfs/send.c:__get_cur_name_and_parent() {
 ## Structure
 Create a note for these items, all of which your report should include:
 
-- [ ] git sha of the commit
-- [ ] Author: line from the commit
+- [ ] The commit header, in the form `git show` prints it:
+  - [ ] First line: the word `commit`, one space, then the full git sha.
+        No colon. Write `commit 06e4fcc9...`, never `commit: 06e4fcc9...`,
+        `commit:06e4fcc9...` nor `Commit 06e4fcc9...`.
+  - [ ] Second line: `Author: $Name <$email>`, taken from the commit.
+  - [ ] `commit` is the only header line without a colon, because it is git's
+        own output rather than a field you are filling in.
 - [ ] One line subject from the commit
 - [ ] A brief (max 3 sentence) summary of the commit.
 - [ ] Any Link: tags from the commit header

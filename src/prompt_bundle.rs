@@ -19,6 +19,10 @@ use crate::project::ProjectId;
 
 include!(concat!(env!("OUT_DIR"), "/prompts_generated.rs"));
 
+#[cfg(test)]
+#[path = "prompt_fingerprint.rs"]
+mod prompt_fingerprint;
+
 const COMPLETE_MARKER: &str = ".sashiko-prompts-complete";
 
 /// The installed prompt directory for a project.
@@ -117,11 +121,28 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_prompt_bundle_contains_kernel_review_core() {
+    fn test_prompt_bundle_contains_kernel_false_positive_guide() {
         assert!(
             PROMPT_BUNDLE_FILES
                 .iter()
-                .any(|(path, _)| *path == "kernel/review-core.md")
+                .any(|(path, _)| *path == "kernel/false-positive-guide.md")
+        );
+    }
+
+    #[test]
+    fn test_prompt_bundle_revision_covers_every_file() {
+        // The installed bundle is reused while its revision is unchanged, so
+        // the revision must account for every file in it, the vendored ones
+        // included. build.rs computes it with the same function, over the
+        // files as it read them from disk; this computes it over the files as
+        // they were embedded.
+        let fingerprint = format!(
+            "-{:016x}",
+            prompt_fingerprint::content_fingerprint(PROMPT_BUNDLE_FILES.iter().copied())
+        );
+        assert!(
+            PROMPT_BUNDLE_REVISION.ends_with(&fingerprint),
+            "{PROMPT_BUNDLE_REVISION} does not end with the fingerprint of the bundled files, {fingerprint}"
         );
     }
 
@@ -183,11 +204,50 @@ mod tests {
             );
         }
 
+        assert_index_guides_bundled("sashiko");
+    }
+
+    #[test]
+    fn test_kannaka_prompt_bundle_integrity() {
+        // Kannaka Labs addition. build.rs bundles only third_party/prompts and
+        // projects/<project>/prompts; a Kannaka prompt left anywhere else still
+        // passes every test that reads the source tree, and the binary ships
+        // without it (an upstream sync on 2026-10-15 moved the prompt roots).
+        let required_framing = [
+            "kannaka/review-core.md",
+            "kannaka/severity.md",
+            "kannaka/false-positive-guide.md",
+            "kannaka/prompt-injection.md",
+            "kannaka/github-summary-template.md",
+            "kannaka/subsystem/subsystem.md",
+        ];
+        for path in required_framing {
+            assert!(
+                PROMPT_BUNDLE_FILES.iter().any(|(p, _)| *p == path),
+                "missing framing file in bundle: {path}"
+            );
+        }
+
+        assert_index_guides_bundled("kannaka");
+    }
+
+    #[test]
+    fn test_kernel_subsystem_index_guides_are_bundled() {
+        // The pre-screen offers the kernel index's guides by name, and a name
+        // with no file behind it loads as nothing, so a guide renamed or
+        // removed by a sync would be lost without any error.
+        assert_index_guides_bundled("kernel");
+    }
+
+    /// Asserts every guide named in `<project>/subsystem/subsystem.md` is in
+    /// the bundle, under subsystem/ or patterns/.
+    fn assert_index_guides_bundled(project: &str) {
+        let index_path = format!("{project}/subsystem/subsystem.md");
         let subsystem_index = PROMPT_BUNDLE_FILES
             .iter()
-            .find(|(p, _)| *p == "sashiko/subsystem/subsystem.md")
+            .find(|(p, _)| *p == index_path)
             .and_then(|(_, bytes)| std::str::from_utf8(bytes).ok())
-            .expect("sashiko/subsystem/subsystem.md must be valid UTF-8");
+            .unwrap_or_else(|| panic!("{index_path} must be valid UTF-8"));
 
         let mut referenced_guides = Vec::new();
         for line in subsystem_index.lines() {
@@ -210,14 +270,14 @@ mod tests {
         );
 
         for guide in referenced_guides {
-            let in_subsystem = format!("sashiko/subsystem/{guide}");
-            let in_patterns = format!("sashiko/patterns/{guide}");
+            let in_subsystem = format!("{project}/subsystem/{guide}");
+            let in_patterns = format!("{project}/patterns/{guide}");
             let found = PROMPT_BUNDLE_FILES
                 .iter()
                 .any(|(p, _)| *p == in_subsystem || *p == in_patterns);
             assert!(
                 found,
-                "guide {guide} referenced in sashiko/subsystem/subsystem.md not found in bundle under subsystem/ or patterns/"
+                "guide {guide} referenced in {index_path} not found in bundle under subsystem/ or patterns/"
             );
         }
     }

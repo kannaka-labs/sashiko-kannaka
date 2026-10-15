@@ -494,7 +494,11 @@ mod tests {
         assert_eq!(args[pos("--model").unwrap() + 1], "sonnet");
         assert_eq!(args[pos("--effort").unwrap() + 1], "high");
         assert!(pos("--print").is_some() && pos("--no-session-persistence").is_some());
-        assert!(claude_cli_args("opus", None).iter().all(|a| a != "--effort"));
+        assert!(
+            claude_cli_args("opus", None)
+                .iter()
+                .all(|a| a != "--effort")
+        );
     }
 
     #[test]
