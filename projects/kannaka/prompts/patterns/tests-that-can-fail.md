@@ -46,3 +46,31 @@ them; tests must not depend on the caller's environment.
 
 - For documentation, prompt text, configuration or trivial changes.
 - Where an existing test already fails on the bug the change fixes.
+
+## When a test concern is a finding
+
+A weak or missing test is evidence about the code, not a defect in itself. Report
+it as a finding only when one of these holds:
+
+1. **The code under it is wrong.** Then the finding is the code defect, named by
+   mechanism and location; the weak test is supporting evidence in it, not a
+   separate finding.
+2. **New logic has no test at all.** A new function, module, binary or branch of
+   real behaviour that no test executes.
+3. **The change claims a test it does not contain.** The commit message or a
+   comment says something is tested, and the diff does not show it.
+
+Otherwise (the changed code is tested and the concern is more branches, stronger
+assertions, another kind of test, or a fixture you would have written
+differently) it is not a finding. If it is worth saying, say it once in the
+summary as a suggestion, with no severity.
+
+## Not defects of this change
+
+- Behaviour that is pre-existing, bounded and ends in a correct state (a retry
+  capped by a limit that ends in a recorded failure) is not a defect of the
+  change under review, even if you would have designed it differently.
+- Two outputs that report different things by design (a status that says
+  "findings exist" and an exit code that says "new high findings exist") do not
+  contradict each other. Check what each one is documented to mean before
+  calling them inconsistent.
